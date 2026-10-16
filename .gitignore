@@ -1,0 +1,44 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+
+# 环境变量 —— ⚠️ 绝不要提交 .env。部署平台的 secret 才是唯一正确的位置。
+#
+# 写成 `.env.*` 通配而不是一个个列，是因为「漏掉一个变体」是这里唯一的失败方式，
+# 而它不会报错：文件安安静静被 git 跟踪，直到某天 push 出去。
+# 所以规则反过来 —— 默认全挡，只放行那个**故意要公开的**模板。
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.pid
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.swp
+
+# 测试覆盖率
+coverage/
+.nyc_output/
+
+# Prisma 生成物（由 prisma generate 重建，不进仓库）
+src/generated/
+prisma/migrations/dev.db*
+
+# 本地数据卷
+.docker-data/
+
+# TS 增量编译缓存 —— 每次 build 都变，进仓库只会制造无意义的 diff
+*.tsbuildinfo

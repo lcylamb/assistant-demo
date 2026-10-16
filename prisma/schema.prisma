@@ -1,0 +1,105 @@
+// 报销单演示库的 schema。
+//
+// 设计原则（数据建模为什么这么选）：
+//   1. 主表 + 明细表 —— 总额不单独存成「事实」，而是明细之和的投影（amount 由 seed 保证一致）。
+//      真实系统里这里通常会加一条「对账」约束或触发器，练习项目保持在应用层校验。
+//   2. 状态和分类用 enum 而不是自由字符串 —— 图形上它把模型的回答空间收窄了：
+//      prompt 里可以把枚举值全部列出来，模型只能在合法值里选，结构化输出的校验才立得住。
+//   3. 可空字段是「有信息量」的那种空，不是随手标的 —— rejectReason 只在 REJECTED 时有值，
+//      decidedAt 只在已决策时有值。这给了「信息不足」一个自然的来源：
+//      问一张还没决策的单子「审批意见是什么」，正确答案就是「数据里没有」，而不是编一个。
+
+generator client {
+  // ⚠️ Prisma 7 把 generator 从 `prisma-client-js` 改名为 `prisma-client`，
+  // 而且 `output` 变成**必填**：生成的 client 不再塞进 node_modules/@prisma/client，
+  // 而是落到项目里的下面这个路径，import 也改成相对路径。
+  //
+  // 好处是产物可见、类型跳转直接进源码；代价是每次 clone 后要跑一次 `prisma generate`
+  // （已挂到 package.json 的 postinstall）。src/generated/ 在 .gitignore 里。
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  // ⚠️ Prisma 7 起，schema 里**不能再写** `url = env("DATABASE_URL")`，
+  // 写了会直接报 P1012。连接串移到 prisma.config.ts。
+  // 原因：PrismaClient 不再自己管连接，改为接收一个 driver adapter（见 prisma.config.ts）。
+  provider = "postgresql"
+}
+
+/// 报销单状态。取值刻意保持少而互斥。
+enum ExpenseStatus {
+  DRAFT // 草稿：还没提交，审批人看不到
+  SUBMITTED // 待审批
+  APPROVED // 已通过，等待打款
+  REJECTED // 已驳回，此时 rejectReason 必有值
+  PAID // 已打款
+}
+
+/// 费用分类。主表和明细共用一套取值，方便按分类做聚合。
+enum ExpenseCategory {
+  TRAVEL // 差旅
+  OFFICE // 办公用品
+  ENTERTAIN // 业务招待
+  TRANSPORT // 市内交通
+  OTHER // 其他
+}
+
+/// 一张报销单。
+model Expense {
+  id String @id @default(cuid())
+
+  /// 人可读的单号，如 BX-2026-0007。对外展示和提问都用它。
+  code String @unique
+
+  title String
+
+  /// 提交人。演示数据里一律用「张三」这类占位姓名，不含任何真实人员信息。
+  applicant  String
+  department String
+
+  category ExpenseCategory
+
+  /// 报销总额。等于所有 items.amount 之和 —— 由 seed 脚本计算写入，不手填。
+  amount Decimal @db.Decimal(12, 2)
+
+  status ExpenseStatus @default(DRAFT)
+
+  /// 仅 REJECTED 时有值。见文件头第 3 条。
+  rejectReason String?
+
+  submittedAt DateTime
+  /// 决策时间（通过 / 驳回 / 打款）。草稿和待审批时为 null。
+  decidedAt   DateTime?
+
+  items ExpenseItem[]
+
+  /// 按「最近提交的排前面」查列表是最常见的入口，索引直接建在它上面。
+  @@index([submittedAt(sort: Desc)])
+  @@index([status])
+  @@map("expenses")
+}
+
+/// 报销单下的一条费用明细。
+model ExpenseItem {
+  id String @id @default(cuid())
+
+  expenseId String
+  expense   Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+
+  /// 费用事由，如「深圳→北京 高铁二等座」。
+  name     String
+  category ExpenseCategory
+  amount   Decimal            @db.Decimal(12, 2)
+
+  /// 补充说明。可空 —— 大多数明细没有备注。
+  note String?
+
+  /// 费用实际发生的日期。注意它和 Expense.submittedAt 不是一回事：
+  /// 可以先发生、后报销，所以两者会相差几天甚至跨月。
+  /// 提问「3 月发生了什么费用」时，正确答案按这个字段算，不按提交时间 —— 这是个好陷阱用例。
+  spentOn DateTime
+
+  @@index([expenseId])
+  @@map("expense_items")
+}

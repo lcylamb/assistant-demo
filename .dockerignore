@@ -1,0 +1,36 @@
+# 进镜像的东西。Dockerfile 里**没有** `COPY . .`，每个 COPY 都是点名的路径 ——
+# 这是第一道防线，这里的规则是第二道。两道都要有：
+# 第一道防的是「手滑加了一行 COPY . .」，这一道防的是「COPY 的路径下面夹带了别的」。
+#
+# ⚠️ 有一条不是「省体积」而是**安全**：`.env` 绝不能进镜像。
+# 镜像的每一层都能被任何拿到镜像的人 pull 下来翻（`docker save` 出来就能读），
+# 把 .env 写进去等于把密钥公开。运行时由部署平台注入环境变量。
+
+# 依赖和产物都在镜像里重装、重构建。
+# 尤其是 node_modules —— macOS 上装的那份里是 darwin 的二进制，
+# 拷进 linux 镜像会以一种「装是装上了，跑起来报 exec format error」的方式炸。
+node_modules
+dist
+
+# Prisma 生成物：镜像里由 `prisma generate` 重建（见 Dockerfile 的 build 阶段）
+src/generated
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 测试、覆盖率、本地数据卷、编辑器与缓存 —— 运行时一律用不到
+test
+coverage
+.docker-data
+.git
+.gitignore
+*.log
+*.tsbuildinfo
+.DS_Store
+.vscode
+.idea
+
+# 文档不进镜像。README 是给人看的，容器里没有任何东西会读它。
+*.md

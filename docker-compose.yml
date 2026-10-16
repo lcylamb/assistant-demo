@@ -1,0 +1,94 @@
+# 本地开发用的 PostgreSQL。
+#
+# ⚠️ 端口用 5433，不是默认的 5432 —— 本机上已经有一个别的项目的 Postgres 容器占着 5432。
+# 换端口是为了彻底隔开：这里的连接串、数据、容器名都跟那个项目无关。
+#
+#   docker compose up -d db      # 只起库（日常开发用这个）
+#   docker compose up --build    # 起整套：库 + 迁移 + 应用
+#   docker compose down          # 停（数据留在 volume 里）
+#   docker compose down -v       # 停 + 删数据
+#
+# ⚠️ 一个很容易踩的坑：**同一个 DATABASE_URL 在两个地方取值不一样。**
+#
+#   宿主机上跑 `npm run start:dev` →  localhost:5433   （走 db 映射出来的端口）
+#   compose 里跑 app 容器       →  db:5432        （走容器网络里的服务名和内部端口）
+#
+# 不是笔误，也不是谁写错了。容器里的 localhost 是容器自己，那里没有数据库。
+# 因为这两个值都对，所以这个坑不会报「配置错误」，只会报「连接被拒绝」。
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: assistant-demo-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: assistant_demo
+      # 中文排序 / 编码，避免 seed 里的中文在上海时区下排错
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+    ports:
+      - '5433:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 用 pg_isready 而不是 tcp 探测：容器起来了但 PG 还在 initdb 时会误判为健康
+      test: ['CMD-SHELL', 'pg_isready -U demo -d assistant_demo']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ── 迁移：一次性任务，跑完就退出 ──
+  #
+  # 单独一个服务、单独一个镜像阶段（Dockerfile 的 migrator），因为它的权限
+  # 和常驻应用不是一回事：它能改表结构，而 app 只需要读写数据。
+  # 让 app 容器带着「能改 schema」的能力跑几个月，没有任何好处。
+  migrate:
+    build:
+      context: .
+      target: migrator
+    container_name: assistant-demo-migrate
+    environment:
+      DATABASE_URL: postgresql://demo:demo@db:5432/assistant_demo?schema=public
+    depends_on:
+      db:
+        condition: service_healthy
+    # 'no' 是刻意的，不能用默认的 unless-stopped：
+    # 迁移失败就该停在那里让人看见。自动重启只会把一个错误刷成刷屏日志，
+    # 而且会把一个跑到一半的迁移反复重试 —— 那时要处理的是残留状态，不是再试一次。
+    restart: 'no'
+
+  # ── 应用 ──
+  app:
+    build:
+      context: .
+      target: runtime
+    container_name: assistant-demo-app
+    environment:
+      NODE_ENV: production
+      PORT: 3100
+      DATABASE_URL: postgresql://demo:demo@db:5432/assistant_demo?schema=public
+      # 演示用假模型，不需要 key。换成真厂商时，key 从部署平台的 secret 注入，
+      # **不要写进这个文件** —— compose 文件是要进仓库的。
+      LLM_PROVIDER: mock
+      # 限流默认 30 次/分/IP。这里显式写出来是为了让它可见，
+      # 不然调这个值时得先翻 app.module.ts 才知道有这个开关。
+      RATE_LIMIT_PER_MINUTE: 30
+      # TRUST_PROXY 故意留空：本地直连，没有反向代理。
+      # 真部署到托管平台时再设成 1，原因写在 src/app-setup.ts 里。
+      # TRUST_PROXY: 1
+    ports:
+      - '3100:3100'
+    depends_on:
+      db:
+        condition: service_healthy
+      # 等迁移真的**成功退出**，不是「启动了」。
+      # 只写 `- migrate` 的话，app 可能在建表之前就开始接请求，
+      # 于是启动瞬间的请求会撞上「表不存在」—— 一个只在冷启动出现的 bug。
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
