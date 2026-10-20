@@ -1,6 +1,7 @@
 import { ValidationPipe, type NestApplicationOptions } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'node:path';
+import { RequestIdLogger, requestIdMiddleware } from './request-context.js';
 
 /**
  * 建应用时传给 Nest 的选项。
@@ -36,6 +37,14 @@ export const APP_OPTIONS: NestApplicationOptions = {
  * 而这种漂移不会有任何报错提示。
  */
 export function applyGlobalSetup(app: NestExpressApplication): void {
+  // ── 请求 id ──
+  //
+  // 必须是第一个中间件：从它之后打的每一行日志才带得上 id。
+  // 日志器换的是**全局**实例，所以模块里那些 `new Logger(...)` 都会经过它 ——
+  // 这也是为什么只在 setup 里换一次就够，不用每个 service 各传一个。
+  app.use(requestIdMiddleware);
+  app.useLogger(new RequestIdLogger());
+
   app.useGlobalPipes(
     new ValidationPipe({
       // DTO 用 class 而不是 interface，就是为了让这里在运行时有东西可校验。

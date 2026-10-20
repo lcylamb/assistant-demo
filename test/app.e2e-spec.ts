@@ -41,4 +41,29 @@ describe('应用外壳 (e2e)', () => {
     expect(response.headers['content-type']).toContain('text/html');
     expect(response.text).toContain('报销单问答');
   });
+
+  it('每个响应都带 X-Request-Id；客户端带来的合法 id 会沿用', async () => {
+    // 生成：没有传的时候必须有一个，否则「用户报了一个 id」这件事根本无从发生。
+    const generated = await request(app.getHttpServer())
+      .get('/health')
+      .expect(200);
+    expect(generated.headers['x-request-id']).toMatch(
+      /^[A-Za-z0-9._:-]{8,64}$/,
+    );
+
+    // 沿用：网关或前端先编了一个 id，我们再换一个就把两边的日志切断了。
+    const echoed = await request(app.getHttpServer())
+      .get('/health')
+      .set('X-Request-Id', 'client-abc-12345')
+      .expect(200);
+    expect(echoed.headers['x-request-id']).toBe('client-abc-12345');
+
+    // 不合法：这个值会进日志和响应头，所以带空格/换行的必须换掉，不能原样回显。
+    const rejected = await request(app.getHttpServer())
+      .get('/health')
+      .set('X-Request-Id', 'bad id with spaces')
+      .expect(200);
+    expect(rejected.headers['x-request-id']).not.toBe('bad id with spaces');
+    expect(rejected.headers['x-request-id']).toMatch(/^[A-Za-z0-9._:-]{8,64}$/);
+  });
 });

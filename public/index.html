@@ -647,6 +647,9 @@ async function ask() {
   const startedAt = performance.now();
   let firstDeltaAt = null;
   let deltaChars = 0;
+  // 服务端给这次请求编的 id（响应头里）。用户报「刚才那次很慢」时，
+  // 这是唯一能对上服务端日志的东西 —— 所以失败时要让他看得见。
+  let requestId = null;
 
   // 快照：请求飞出去之后 history 还可能被别的操作改掉（比如用户换了单号），
   // 而这次请求该带的是「发出去那一刻」的上下文。
@@ -663,6 +666,8 @@ async function ask() {
 
     // 后端在写 SSE 响应头**之前**就取完数了，所以「单号不存在」「参数不合法」
     // 这类错误在这里还能拿到一个正常的 JSON 响应 —— 不是一段流。
+    requestId = response.headers.get('x-request-id');
+    bot.requestId = requestId;
     if (!response.ok) {
       const body = await response.json().catch(() => null);
       const message = body && body.message;
@@ -851,6 +856,23 @@ function finish(bot, result, startedAt, firstDeltaAt, deltaChars) {
     line.textContent = `　·　查了 ${tools.join(' → ')}`;
     bot.metrics.appendChild(line);
   }
+
+  showRequestId(bot);
+}
+
+/**
+ * 把请求 id 放到这一轮的指标区（成功时是附属信息，失败时是唯一线索）。
+ *
+ * 用 textContent 而不是拼 HTML：这个值虽然经过服务端白名单校验，
+ * 但「服务端字符串不当 HTML 解析」这条规矩不该为了一个 id 破例。
+ * 失败路径上指标区是空的，所以分隔符按有没有前文来定。
+ */
+function showRequestId(bot) {
+  if (!bot.requestId) return;
+  const line = document.createElement('span');
+  const separator = bot.metrics.childNodes.length > 0 ? '　·　' : '';
+  line.textContent = `${separator}请求 ${bot.requestId}`;
+  bot.metrics.appendChild(line);
 }
 
 /**
@@ -883,6 +905,8 @@ function fail(bot, message) {
   bot.turn.classList.add('error');
   bot.text.textContent = message;
   setStatus(bot, 'error');
+  // 失败时这个 id 尤其重要：用户报告的正是「那一次」。
+  showRequestId(bot);
 }
 
 /** 用户点了停止。已经吐出来的字留在屏幕上，但要标明它没走到最终校验。 */
