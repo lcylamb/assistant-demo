@@ -1,4 +1,8 @@
-import { BadGatewayException, Logger } from '@nestjs/common';
+import {
+  BadGatewayException,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { Prisma } from '../../generated/prisma/client.js';
 import { AssistantService, HALLUCINATION_WARN } from './assistant.service.js';
 import type {
@@ -77,14 +81,30 @@ const ITEMS = {
  *
  * 判断顺序不重要 —— 三个工具的 select 互不重叠（`prepare()` 只要 id）。
  * 哪个 select 里出现了那个工具的招牌列，就回那块数据。
+ *
+ * `failPrepare` / `failTools` 用来注入失败。`failTools: true` 是那个**普通**的
+ * 工具失败（降级成「信息不足」，见对应用例）；要测「库连不上」请传一个
+ * `prismaError('P1001')` —— 两者在 service 里走的是完全不同的分支。
  */
-function makePrisma(options: { failTools?: boolean } = {}) {
+function makePrisma(
+  options: {
+    failPrepare?: Error;
+    failTools?: boolean | Error;
+  } = {},
+) {
   const findUnique = vi.fn(
     async ({ select }: { select?: Record<string, boolean> }) => {
       if (!select) return { id: 'exp_1' };
-      if (select.id) return { id: 'exp_1' };
+      if (select.id) {
+        if (options.failPrepare) throw options.failPrepare;
+        return { id: 'exp_1' };
+      }
 
-      if (options.failTools) throw new Error('数据库连接断了');
+      if (options.failTools) {
+        throw options.failTools === true
+          ? new Error('数据库连接断了')
+          : options.failTools;
+      }
 
       if (select.title) return HEADER;
       if (select.items) return ITEMS;
@@ -94,6 +114,20 @@ function makePrisma(options: { failTools?: boolean } = {}) {
   );
 
   return { expense: { findUnique } };
+}
+
+/**
+ * 造一个 Prisma 自己的错误。
+ *
+ * 不用 `new Error('连不上')` 冒充：分类器认的是**类型 + 码**，
+ * 一个普通的 Error 恰好会被正确地判成「不是库不可用」——
+ * 那样写出来的用例永远绿，而且证明不了任何事。
+ */
+function prismaError(code: string): Prisma.PrismaClientKnownRequestError {
+  return new Prisma.PrismaClientKnownRequestError(
+    `Invalid \`prisma.expense.findUnique()\` invocation\n\nCan't reach database server at 127.0.0.1:1`,
+    { code, clientVersion: '7.10.1' },
+  );
 }
 
 function makeService(prisma: ReturnType<typeof makePrisma>, llm: LlmProvider) {
@@ -330,6 +364,68 @@ describe('AssistantService（Agent 循环）', () => {
     expect(llm.calls[1].at(-1)).toMatchObject({ role: 'tool', toolCallId: 'call_1' });
   });
 
+  it('取数时库连不上 → 503，而不是 500（500 会被当成代码 bug）', async () => {
+    const llm = scriptedLlm([]);
+    const error = await makeService(
+      makePrisma({ failPrepare: prismaError('P1001') }),
+      llm,
+    )
+      .ask(DTO)
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ServiceUnavailableException);
+    expect((error as ServiceUnavailableException).getStatus()).toBe(503);
+    expect((error as Error).message).toBe('数据库暂时不可用，请稍后重试');
+
+    // 取数都失败了，模型一次都不该被调用 —— 不该先花钱再报错。
+    expect(llm.calls).toHaveLength(0);
+  });
+
+  it('工具轮里库连不上 → 整个请求 503，而不是 200 +「信息不足」', async () => {
+    const llm = scriptedLlm([
+      { text: '', model: 'scripted', toolCalls: [toolCall('get_expense_summary')] },
+    ]);
+
+    const service = makeService(
+      makePrisma({ failTools: prismaError('P1001') }),
+      llm,
+    );
+    const error = await service.ask(DTO).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ServiceUnavailableException);
+    expect((error as Error).message).toBe('数据库暂时不可用，请稍后重试');
+
+    // 关键：没有第二轮。库都连不上了，再让模型答一轮只会得到一个
+    // 「查不到」的结论 —— 那个 200 和「库里确实没有这条数据」在响应里没法区分。
+    expect(llm.calls).toHaveLength(1);
+
+    // 失败照样打点，否则「错误率」在库挂掉那段时间会静默地变成 0。
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+  });
+
+  it('业务类 Prisma 错误（P2002）不算库不可用，仍走原来的降级', async () => {
+    // 白名单不是「所有 Prisma 错误」：把唯一键冲突也报成 503，
+    // 等于用「服务暂时不可用」盖住一个真正的 bug。
+    const llm = scriptedLlm([
+      { text: '', model: 'scripted', toolCalls: [toolCall('get_expense_summary')] },
+      {
+        text: answer({ conclusion: '信息不足。', evidence: [], insufficient: true }),
+        model: 'scripted',
+        toolCalls: [],
+      },
+    ]);
+
+    const result = await makeService(
+      makePrisma({ failTools: prismaError('P2002') }),
+      llm,
+    ).ask(DTO);
+
+    expect(result.insufficient).toBe(true);
+    expect(result.trace).toEqual([{ tool: 'get_expense_summary', ok: false }]);
+  });
+
   it('依据的白名单是**本次查过的**字段，不是整张单子的字段', async () => {
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
@@ -552,6 +648,29 @@ describe('AssistantService.streamAnswer（带工具的流）', () => {
     expect(service.measurements[0].ttftMs).toEqual(expect.any(Number));
     // 第二轮确实拿着工具结果在答。
     expect(llm.calls[1].at(-1)?.content).toContain('招待费超出标准');
+  });
+
+  it('工具轮里库连不上 → 流里给一个 error 事件，而不是把连接断在半路', async () => {
+    const llm = streamingLlm([
+      [{ type: 'tool_call', call: toolCall('get_expense_summary') }],
+    ]);
+    const service = makeService(
+      makePrisma({ failTools: prismaError('P1001') }),
+      llm,
+    );
+
+    const events = await collect(service);
+
+    // 响应头在这之前早就发出去了（controller 先 flushHeaders 才开始迭代），
+    // 所以这里只能给事件。直接抛的后果是：客户端拿到一段没有 error 帧的截断流，
+    // 页面上的字永远停在「生成中」。
+    expect(events).toEqual([
+      { type: 'error', message: '数据库暂时不可用，请稍后重试' },
+    ]);
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+    expect(llm.calls).toHaveLength(1);
   });
 
   it('一次都不调工具时，行为和非流式一致（同一套收口）', async () => {

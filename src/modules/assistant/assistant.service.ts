@@ -6,8 +6,10 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { isDatabaseUnavailable } from '../../prisma/database-unavailable.js';
 import { DailyQuotaService } from '../llm/daily-quota.service.js';
 import {
   LLM_PROVIDER,
@@ -75,6 +77,17 @@ export const HALLUCINATION_WARN = '模型引用了不存在的字段';
  * 话术必须是同一句：同一个原因在页面上有两种说法，读起来像两个不同的问题。
  */
 const QUOTA_MESSAGE = '今天的演示额度用完了，明天再来。';
+
+/**
+ * 数据库在请求中途连不上时给用户看的话。
+ *
+ * 和额度那句同理，两条端点必须说同一句话 —— 流式那条只能塞进 error 事件，
+ * 非流式是 503 的 message。同一个原因两种说法，读起来像两个问题。
+ *
+ * 话术刻意不提「重试」以外的东西：到底是连接池满了还是实例重启了，
+ * 用户既不需要知道、也不该从错误里读到。原因留在日志里。
+ */
+const DB_UNAVAILABLE_MESSAGE = '数据库暂时不可用，请稍后重试';
 
 /**
  * 一次提问最多允许几轮「模型调工具 → 我们回结果」。
@@ -333,8 +346,18 @@ export class AssistantService {
       outcome = 'error';
       yield { type: 'error', message: '模型反复调用工具，已停止' };
     } catch (error) {
-      // 未预期的异常照样要打点，然后原样抛给 controller 的 finally 去收尾。
       outcome = 'error';
+
+      // 库中途挂了：响应头早就发出去了，这里再抛只会让连接断在半路 ——
+      // 前端等到的是一个没有 error 帧的截断流，界面上那行字会一直停在「生成中」。
+      // 所以翻译成事件，和非流式那个 503 说同一句话。
+      // 抛出点（executeToolCalls）已经记了日志，这里不再重复。
+      if (error instanceof ServiceUnavailableException) {
+        yield { type: 'error', message: DB_UNAVAILABLE_MESSAGE };
+        return;
+      }
+
+      // 未预期的异常照样要打点，然后原样抛给 controller 的 finally 去收尾。
       throw error;
     } finally {
       this.record(session, outcome, ttftMs, trace.length);
@@ -351,10 +374,25 @@ export class AssistantService {
   async prepare(dto: AskDto): Promise<AgentSession> {
     const startedAt = Date.now();
 
-    const expense = await this.prisma.expense.findUnique({
-      where: { code: dto.code },
-      select: { id: true },
-    });
+    // 库连不上和「这张单子不存在」必须分得开：前者是基础设施问题（503，可重试），
+    // 后者是请求本身的问题（404）。不接的话两者都会变成 500 ——
+    // 而 500 的语义是「服务端有 bug」，运维会去翻这段代码，方向从一开始就错了。
+    // 启动时已经查过一次库（见 PrismaService.onModuleInit），所以这里出现
+    // 「连不上」只可能是**起来之后**库挂了。
+    let expense: { id: string } | null;
+    try {
+      expense = await this.prisma.expense.findUnique({
+        where: { code: dto.code },
+        select: { id: true },
+      });
+    } catch (error) {
+      if (!isDatabaseUnavailable(error)) throw error;
+
+      this.logger.error(
+        `查询报销单失败，数据库不可用（${dto.code}）：${describeError(error)}`,
+      );
+      throw new ServiceUnavailableException(DB_UNAVAILABLE_MESSAGE);
+    }
 
     if (!expense) {
       throw new NotFoundException(`没有找到编号为 ${dto.code} 的报销单`);
@@ -417,8 +455,20 @@ export class AssistantService {
             prisma: this.prisma,
           });
         } catch (error) {
+          // 库连不上时**不能**降级成「工具失败，请说明信息不足」。
+          // 那条路会让模型产出一个 200 + insufficient:true 的答案 —— 用户看到的
+          // 是「这张单子查不到」，而真相是整张表都读不了。这种「看起来成功的错误答案」
+          // 比 503 危险得多，而且它和「数据里确实没有」在响应里完全没法区分。
+          // 所以这一类直接终止本次请求，交给上层映射成 503 / 流里的 error 事件。
+          if (isDatabaseUnavailable(error)) {
+            this.logger.error(
+              `工具 ${call.name} 执行失败，数据库不可用，本次请求中止：${describeError(error)}`,
+            );
+            throw new ServiceUnavailableException(DB_UNAVAILABLE_MESSAGE);
+          }
+
           this.logger.error(
-            `工具 ${call.name} 执行失败：${error instanceof Error ? error.message : String(error)}`,
+            `工具 ${call.name} 执行失败：${describeError(error)}`,
           );
           outcome = {
             ok: false,
@@ -628,4 +678,27 @@ function noteUsage(session: AgentSession, usage: LlmUsage | undefined): void {
 
 function truncate(text: string, max = 300): string {
   return text.length <= max ? text : `${text.slice(0, max)}…（共 ${text.length} 字）`;
+}
+
+/**
+ * 把异常压成一行，给日志用。
+ *
+ * Prisma 的 message 是多行的：第一行是「哪次调用失败了」，中间是代码框，
+ * **真正的原因在最后一行**（例如 `Can't reach database server at ...`）。
+ * 直接打整段会把一行日志撑成十几行，直接截前面 300 字又恰好把原因截掉。
+ * 所以取最后一行，前面补上错误类型和 Prisma 的码 —— 一行里三样都在。
+ */
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+
+  const lines = error.message
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+  const root = lines.at(-1) ?? error.message;
+  const code = (error as { code?: unknown }).code;
+
+  return typeof code === 'string'
+    ? `${error.name} ${code}: ${root}`
+    : `${error.name}: ${root}`;
 }
