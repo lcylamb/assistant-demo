@@ -1,11 +1,14 @@
 import {
   BadGatewayException,
+  HttpException,
+  HttpStatus,
   Inject,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { DailyQuotaService } from '../llm/daily-quota.service.js';
 import {
   LLM_PROVIDER,
   type LlmMessage,
@@ -65,6 +68,15 @@ export interface PreparedAsk {
  */
 export const HALLUCINATION_WARN = '模型引用了不存在的字段';
 
+/**
+ * 额度用完时给用户看的话。
+ *
+ * 单独成常量是因为它出现在**两条端点**上，而两条路的拒绝方式不同 ——
+ * 非流式抛 429，流式只能往流里发一个 error 事件（响应头早就发出去了）。
+ * 话术必须是同一句：同一个原因在页面上有两种说法，读起来像两个不同的问题。
+ */
+const QUOTA_MESSAGE = '今天的演示额度用完了，明天再来。';
+
 @Injectable()
 export class AssistantService {
   private readonly logger = new Logger(AssistantService.name);
@@ -72,20 +84,35 @@ export class AssistantService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(LLM_PROVIDER) private readonly llm: LlmProvider,
+    private readonly quota: DailyQuotaService,
   ) {}
 
   /**
    * 问一句，拿回结构化答案。
    *
    * 五个步骤，每一步都对应一个可能出错的地方，且错的种类不同：
-   *   取数（单号不存在）→ 组 prompt（不涉及失败）→ 调用（网络/鉴权）
+   *   取数（单号不存在）→ 组 prompt（不涉及失败）→ 调用（网络/鉴权/额度）
    *   → 解析（模型没按格式答）→ 字段校验（模型编了字段）
    * 前四种各有各的异常，最后一种只记日志 —— 理由见 dropUnknownEvidence。
    */
   async ask(dto: AskDto): Promise<AskResult> {
     const prepared = await this.prepare(dto);
+    this.assertQuota();
 
-    const completion = await this.llm.complete(prepared.messages);
+    let completion;
+    try {
+      completion = await this.llm.complete(prepared.messages);
+    } catch (error) {
+      // ⚠️ 这一层在接真模型之前是**不需要**的，因为假模型不会失败。
+      // 真实厂商会：密钥过期、余额用尽、超时、502。不接住的话它变成一个 500，
+      // 而 500 的语义是「服务端有 bug」—— 上游看到就会去翻代码，方向从一开始就错了。
+      // 这是「别人的服务不可用」，是 502。
+      this.logger.error(
+        `调用模型失败（${this.llm.name}）：${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new BadGatewayException('模型调用失败，请重试');
+    }
+
     this.logger.log(
       `[${this.llm.name}] ${completion.model} 回答 ${dto.code}（${completion.text.length} 字）`,
     );
@@ -108,6 +135,14 @@ export class AssistantService {
   ): AsyncGenerator<AssistantStreamEvent> {
     let buffer = '';
     let emitted = '';
+
+    // 额度检查在**这里**，不能像 ask() 那样抛异常：controller 早就把 SSE 的
+    // 响应头发给浏览器了，那时再抛只会把连接搞断，用户什么也看不到。
+    // 所以超限的表示方式是流里的一个 error 事件 —— 前端已经会渲染它。
+    if (!this.quota.consume()) {
+      yield { type: 'error', message: QUOTA_MESSAGE };
+      return;
+    }
 
     try {
       const stream = await this.llm.stream(prepared.messages, { signal });
@@ -164,6 +199,17 @@ export class AssistantService {
       availableFields: context.availableFields,
       messages: buildMessages(context, dto.question),
     };
+  }
+
+  /**
+   * 额度闸。**放在 `prepare()` 之后** —— 顺序是有意义的：
+   * 单号不存在是 404，那次请求根本没碰模型，不该算掉一次额度。
+   * 写反了的话，一个脚本可以拿不存在的单号把当天额度刷光，而它一次模型都没调。
+   */
+  private assertQuota(): void {
+    if (!this.quota.consume()) {
+      throw new HttpException(QUOTA_MESSAGE, HttpStatus.TOO_MANY_REQUESTS);
+    }
   }
 
   /** 取数并摊平。找不到单子就是 404 —— 这不是模型的失败，不该报成 5xx。 */

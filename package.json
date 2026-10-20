@@ -22,6 +22,7 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "eval": "vitest run --config ./vitest.config.e2e.ts test/assistant-eval.e2e-spec.ts",
+    "eval:real": "LLM_PROVIDER=openai vitest run --config ./vitest.config.e2e.ts test/assistant-eval.e2e-spec.ts",
     "db:up": "docker compose up -d db",
     "db:down": "docker compose down",
     "db:generate": "prisma generate",

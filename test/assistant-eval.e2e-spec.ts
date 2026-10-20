@@ -13,6 +13,10 @@ import {
   type ExpenseWithItems,
 } from '../src/modules/assistant/expense-context.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
+import {
+  LLM_PROVIDER,
+  type LlmProvider,
+} from '../src/modules/llm/llm.types.js';
 import { asResult, parseSse } from './support/sse.js';
 
 /**
@@ -55,10 +59,15 @@ import { asResult, parseSse } from './support/sse.js';
  *
  * ── 诚实边界（最该记住的一段）──
  *
- * 现在跑的是 `MockLlmProvider`，一张规则表，不是模型。
- * 所以这份评测能证明的是「**评测本身是有效的**」：它能红、能算幻觉率、
- * 能发现两条端点不一致。它**不能**证明「模型答得准」—— 那必须在真厂商上跑同一份用例。
+ * 这份用例挂在**哪个 provider 上**是被测环境决定的：
+ *   · `npm run eval`      → `MockLlmProvider`，一张规则表，不是模型。
+ *   · `npm run eval:real` → 真厂商（`LLM_PROVIDER=openai`）。
+ *
+ * 跑 mock 时它证明的是「**评测本身是有效的**」：能红、能算幻觉率、能发现两条端点不一致。
+ * 它**不能**证明「模型答得准」—— 那必须在真厂商上跑同一份用例。
  * 这两件事从头到尾都不是一回事，别混着说。
+ *
+ * 所以下面那张表**必须印出 provider 名字**：一份不说是谁答的报告，是没法两两比较的。
  */
 
 // ─────────────────────────────────────────────────────────────
@@ -282,12 +291,14 @@ function structuralProblems(result: AskResult, context: ExpenseContext): string[
     problems.push(`依据里有数据里不存在的字段：[${unknown.join(', ')}]`);
   }
 
-  // 金额溯源：带 ¥ 或「元」的数字，必须能在数据里找到同一个数。
+  // 金额溯源：带 ¥ 或「元」的数字，要么能在数据里找到同一个数，
+  // 要么不超过这张单子的总额（模型自己算的中间和，见 MONEY_TOKEN 那段注释）。
   const amounts = knownAmounts(context.record);
+  const total = Math.round(Number(context.record.amount) * 100);
   for (const cents of moneyTokens(result.conclusion)) {
-    if (!amounts.has(cents)) {
-      problems.push(`结论里出现了数据里没有的金额：${formatCents(cents)}`);
-    }
+    if (amounts.has(cents)) continue;
+    if (Number.isFinite(total) && cents > 0 && cents <= total) continue;
+    problems.push(`结论里出现了数据里没有的金额：${formatCents(cents)}`);
   }
 
   // 日期溯源：同上。这一条挡的是「编一个日期出来」。
@@ -339,9 +350,18 @@ function semanticProblems(c: EvalCase, result: AskResult, row: RowData): string[
  * 只在两种形态上认：`¥1234.56` 和 `1234.56 元`。要求有货币符号，
  * 是为了不把「共 3 条明细」的 3、也不把日期里的数字当成金额。
  *
- * ⚠️ 已知的松：模型自己算出来的**中间和**（比如「差旅类共 2700 元」）不在这里的
- * 已知集合里，会被误判成编造。用真模型跑之前得先决定：是放宽成「不超过总额」，
- * 还是把中间和也纳入已知集合。现在是宁可误报也不放过。
+ * ⚠️ **这条检查在接真模型时放宽过一次**，记下来免得下一个人以为它一直是这样。
+ * 原来要求每个数字都能在数据里精确找到。规则表不会做加法，所以它一直没响过；
+ * 真模型会做 —— 「差旅类共 2700 元」里的 2700 数据里没有，于是被判成编造，
+ * 而它其实是**推理出来的中间结果**，是好事。
+ *
+ * 现在认两种：**等于某个已知值**，或者**不超过这张单子的总额**。
+ * 这样留下的是「不能凭空说出一个比总额还大的数」这道闸 —— 那才是编造的形状；
+ * 同时允许模型做加法。
+ *
+ * 诚实代价：模型编一个「比较小、看起来合理」的数字是能混过去的。
+ * 想更严就得把总额拆开做约束（比如「只允许明细金额的任意子集之和」），
+ * 那是个子集和问题，对一个演示项目来说过度了。
  */
 const MONEY_TOKEN = /[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)|([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*元/g;
 
@@ -447,6 +467,8 @@ describe('评测集 (e2e)', () => {
   const results: CaseResult[] = [];
   const warnMessages: string[] = [];
   let warnSpy: MockInstance;
+  /** 这一轮是谁在答。印在报告里 —— 没有它，两份报告没法比。 */
+  let providerName = '';
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -456,6 +478,8 @@ describe('评测集 (e2e)', () => {
     app = moduleFixture.createNestApplication<NestExpressApplication>();
     applyGlobalSetup(app);
     await app.init();
+
+    providerName = app.get<LlmProvider>(LLM_PROVIDER).name;
 
     const prisma = app.get(PrismaService);
     const expenses = await prisma.expense.findMany({
@@ -479,7 +503,7 @@ describe('评测集 (e2e)', () => {
   });
 
   afterAll(() => {
-    printReport(results, warnMessages);
+    printReport(results, warnMessages, providerName);
     warnSpy.mockRestore();
     return app.close();
   });
@@ -655,7 +679,11 @@ const VERDICT_LABEL = {
   fail: '✗ 不符预期',
 } as const;
 
-function printReport(results: CaseResult[], warnMessages: string[]): void {
+function printReport(
+  results: CaseResult[],
+  warnMessages: string[],
+  providerName: string,
+): void {
   const columns = [
     { title: '用例', width: 6 },
     { title: '单号', width: 14 },
@@ -667,7 +695,14 @@ function printReport(results: CaseResult[], warnMessages: string[]): void {
   const rule = columns.map((c) => '─'.repeat(c.width)).join('─┼─');
   const header = columns.map((c) => pad(c.title, c.width)).join(' │ ');
 
-  console.log(`\n评测结果（${results.length} 条用例，每条都跑了两条端点）`);
+  console.log(
+    `\n评测结果（${results.length} 条用例，每条都跑了两条端点）　provider：${providerName}`,
+  );
+  // 跑的是规则表就得说出来。同一张全绿的表，一个是「模型答得准」，
+  // 另一个只是「规则表按预期执行了」—— 两者的含义差着一个量级。
+  if (providerName === 'mock') {
+    console.log('⚠️ 这一轮是规则表在答，不是模型。它证明的是评测本身有效，不是模型答得准。');
+  }
   console.log(header);
   console.log(rule);
 
