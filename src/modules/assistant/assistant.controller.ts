@@ -53,8 +53,20 @@ export class AssistantController {
   @Post('ask')
   @HttpCode(HttpStatus.OK)
   @UseGuards(ModelConcurrencyGuard)
-  ask(@Body() dto: AskDto): Promise<AskResult> {
-    return this.assistant.ask(dto);
+  async ask(
+    @Body() dto: AskDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<AskResult | undefined> {
+    // 非流式也要能停：客户端断开后，在途的模型调用继续跑到预算到点，只是白烧 token。
+    // 判据和流式那边完全一样 —— `close` 正常结束时也会来，所以必须看 `writableEnded`。
+    const abort = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) abort.abort();
+    });
+
+    const result = await this.assistant.ask(dto, abort.signal);
+    // null = 客户端已经走了。返回 undefined，别往一个死连接上再写东西。
+    return result ?? undefined;
   }
 
   /**

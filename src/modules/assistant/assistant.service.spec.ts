@@ -689,6 +689,30 @@ describe('AssistantService.streamAnswer（带工具的流）', () => {
   });
 });
 
+/** 一个永远不回、但会像真 provider 那样响应取消的模型。 */
+function hangingLlm(): LlmProvider {
+  return {
+    name: 'hanging',
+    complete: (_messages, options) =>
+      new Promise<LlmCompletion>((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () =>
+          reject(new Error('模型调用被取消')),
+        );
+      }),
+    stream: async (_messages, options) =>
+      // 真 provider 被取消时是**干净地返回一条空流**，不是抛 —— 这里必须一样，
+      // 否则测到的是一条服务层永远不会遇到的路径。
+      new Promise<LlmStream>((resolve) => {
+        options?.signal?.addEventListener('abort', () =>
+          resolve({
+            model: 'hanging',
+            events: (async function* () {})(),
+          }),
+        );
+      }),
+  };
+}
+
 describe('AssistantService（请求预算）', () => {
   // 每个用例自己设一个小值，跑完恢复 —— 漏了的话后面所有用例都会带着它。
   const saved = process.env.ASK_TIMEOUT_MS;
@@ -697,30 +721,6 @@ describe('AssistantService（请求预算）', () => {
     if (saved === undefined) delete process.env.ASK_TIMEOUT_MS;
     else process.env.ASK_TIMEOUT_MS = saved;
   });
-
-  /** 一个永远不回、但会像真 provider 那样响应取消的模型。 */
-  function hangingLlm(): LlmProvider {
-    return {
-      name: 'hanging',
-      complete: (_messages, options) =>
-        new Promise<LlmCompletion>((_resolve, reject) => {
-          options?.signal?.addEventListener('abort', () =>
-            reject(new Error('模型调用被取消')),
-          );
-        }),
-      stream: async (_messages, options) =>
-        // 真 provider 被取消时是**干净地返回一条空流**，不是抛 —— 这里必须一样，
-        // 否则测到的是一条服务层永远不会遇到的路径。
-        new Promise<LlmStream>((resolve) => {
-          options?.signal?.addEventListener('abort', () =>
-            resolve({
-              model: 'hanging',
-              events: (async function* () {})(),
-            }),
-          );
-        }),
-    };
-  }
 
   it('非流式：模型一直不回，到点给 504，而不是让请求挂住', async () => {
     process.env.ASK_TIMEOUT_MS = '30';
@@ -776,5 +776,68 @@ describe('AssistantService（请求预算）', () => {
 
     // 用户关页面时不该弹任何错误 —— 那一刻已经没人看了。
     expect(events).toEqual([]);
+  });
+});
+
+describe('AssistantService（非流式：客户端断开）', () => {
+  const saved = process.env.ASK_TIMEOUT_MS;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (saved === undefined) delete process.env.ASK_TIMEOUT_MS;
+    else process.env.ASK_TIMEOUT_MS = saved;
+  });
+
+  it('断开时静默返回 null、记成 aborted，不报 502', async () => {
+    process.env.ASK_TIMEOUT_MS = '5000';
+    const warn = vi
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const service = makeService(makePrisma(), hangingLlm());
+
+    const caller = new AbortController();
+    const pending = service.ask(DTO, caller.signal);
+    // 等模型调用真的挂上去，否则测到的只是「一开始就是 aborted」。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    caller.abort();
+
+    // null 而不是抛异常：没有人在等这个答案了，controller 什么都不用做。
+    await expect(pending).resolves.toBeNull();
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'aborted' }),
+    ]);
+    // 用户走了不是厂商坏了 —— 别在日志里留一条要人去查厂商的 warn。
+    expect(
+      warn.mock.calls.some(([message]) =>
+        String(message).includes('模型调用失败'),
+      ),
+    ).toBe(false);
+  });
+
+  it('没有取消信号时行为不变（照常返回答案）', async () => {
+    process.env.ASK_TIMEOUT_MS = '5000';
+    const llm: LlmProvider = {
+      name: 'one-shot',
+      complete: () =>
+        Promise.resolve({
+          text: '{"conclusion":"已通过。","evidence":["status"],"insufficient":false}',
+          model: 'stub',
+          toolCalls: [],
+        }),
+      stream: async () => {
+        throw new Error('这条用例不走流式');
+      },
+    };
+    const service = makeService(makePrisma(), llm);
+
+    const result = await service.ask(DTO);
+
+    expect(result).toMatchObject({
+      conclusion: '已通过。',
+      insufficient: false,
+    });
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'ok' }),
+    ]);
   });
 });

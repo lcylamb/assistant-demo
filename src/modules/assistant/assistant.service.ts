@@ -124,7 +124,23 @@ interface AskBudget {
   signal: AbortSignal | undefined;
   /** 到点了吗。比 `signal.aborted` 可靠 —— 后者也可能是用户自己取消的。 */
   expired(): boolean;
+  /** 是调用方走了吗。和 `expired()` 合起来才能把「谁掐的」分清楚。 */
+  callerAborted(): boolean;
   dispose(): void;
+}
+
+/**
+ * 调用方在响应写出去之前就走了。
+ *
+ * 只在服务内部流转：`ask()` 接住它、静默返回 null。它不是错误 ——
+ * 报成 502 会让人去查厂商，打一条 error 日志会把日志里的错误率抬高，
+ * 而这只是一次「用户关掉了页面」。
+ */
+class ClientDisconnected extends Error {
+  constructor() {
+    super('客户端已断开');
+    this.name = 'ClientDisconnected';
+  }
 }
 
 /**
@@ -188,16 +204,38 @@ export class AssistantService {
    * 每一轮模型调用都是一次「它自己决定下一步」：要工具就调，不要就收口。
    * 失败的种类仍然分得开 —— 取数（404）、额度（429）、模型/厂商（502）、
    * 格式（502，但日志里写着原因）。
+   *
+   * 返回 `null` 只有一个原因：`callerSignal` 在业务跑到一半之前被 abort，也就是
+   * 客户端已经断开。那时没有人在等这个答案，`null` 让 controller 什么都不用做。
+   * 和流式那边的「静默 return」是同一种收场 —— 两个端点都别为一个已经走了的
+   * 用户继续烧 token。
    */
-  async ask(dto: AskDto): Promise<AskResult> {
+  // 两个重载：不带信号时不可能返回 null（没人会取消），带信号时才可能。
+  // 写成一个联合类型的话，所有不传信号的调用方都得去判一次永远不成立的空值。
+  async ask(dto: AskDto): Promise<AskResult>;
+  async ask(dto: AskDto, callerSignal: AbortSignal): Promise<AskResult | null>;
+  async ask(
+    dto: AskDto,
+    callerSignal?: AbortSignal,
+  ): Promise<AskResult | null> {
     const session = await this.prepare(dto);
-    const budget = this.budget();
+    const budget = this.budget(callerSignal);
 
     try {
       const result = await this.runAgent(session, budget);
       this.record(session, 'ok', null, result.trace.length);
       return result;
     } catch (error) {
+      // 先判预算：预算到点和用户取消都会让 signal aborted，但「超时」要告诉
+      // 用户，「用户走了」只需要安静收场。和流式那边的判断顺序保持一致。
+      if (
+        !budget.expired() &&
+        (error instanceof ClientDisconnected || budget.callerAborted())
+      ) {
+        this.logger.log(`客户端已断开，${session.code} 的请求提前结束`);
+        this.record(session, 'aborted', null, 0);
+        return null;
+      }
       // 失败也要打点：一个只统计成功请求的延迟分布，在「变慢了」这件事上会反过来骗人 ——
       // 慢到超时的那些恰恰被排除在外。
       this.record(session, 'error', null, 0);
@@ -220,6 +258,7 @@ export class AssistantService {
       return {
         signal: callerSignal,
         expired: () => false,
+        callerAborted: () => callerSignal?.aborted === true,
         dispose: () => {},
       };
     }
@@ -236,6 +275,7 @@ export class AssistantService {
         ? AbortSignal.any([callerSignal, controller.signal])
         : controller.signal,
       expired: () => expired,
+      callerAborted: () => callerSignal?.aborted === true,
       dispose: () => clearTimeout(timer),
     };
   }
@@ -264,6 +304,7 @@ export class AssistantService {
       // 上一轮的工具可能刚好把预算用完。在**开始下一轮之前**判，
       // 而不是等模型跑完才发现 —— 那一轮的开销就白花了。
       if (budget.expired()) throw this.timeoutError(session);
+      if (budget.callerAborted()) throw new ClientDisconnected();
 
       this.assertQuota();
 
@@ -277,12 +318,17 @@ export class AssistantService {
         // 到点被掐掉和厂商自己失败必须分开：前者是我们主动停的，
         // 报成 502 会让排查的人去查厂商，而真正的原因是这次请求太慢。
         if (budget.expired()) throw this.timeoutError(session);
+        // 用户走了也不是厂商的错 —— 交给 ask() 静默收场，别记成一次模型失败。
+        if (budget.callerAborted()) throw error;
         this.logModelFailure(error);
         throw new BadGatewayException('模型调用失败，请重试');
       }
 
       session.modelCalls += 1;
       noteUsage(session, completion.usage);
+
+      // 模型跑完时用户已经走了：别再花下一轮工具和模型的钱。
+      if (budget.callerAborted()) throw new ClientDisconnected();
 
       if (completion.toolCalls.length === 0) {
         this.logger.log(
