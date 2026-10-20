@@ -295,8 +295,15 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       model: this.config.model,
       // 只传 role/content，别把项目内部的字段顺出去。
       messages: messages.map(({ role, content }) => ({ role, content })),
-      // 温度 0：这个项目要的是「同一份数据问同一个问题，答案稳定」。
-      // 评测的断言建立在这上面 —— 每次跑都换个说法的话，红了也不知道是模型变差了还是掷骰子。
+      // 温度 0 是「尽量稳定」，不是「确定」。
+      //
+      // ⚠️ 这条注释原来写的是「同一份数据问同一个问题，答案稳定，评测的断言建立在这上面」。
+      // 接上真厂商之后实测：同一请求连问三次，两次逐字相同、一次换了说法；
+      // 有时结论一字不差，evidence 却多一个少一个字段。厂商侧的批处理、MoE 路由、
+      // 浮点累加顺序都能让温度 0 仍然不可复现。
+      //
+      // 结论：**任何「两次调用必须逐字相同」的断言都站不住**。评测里跨调用的比较
+      // 因此按 provider 分开（见 test/assistant-eval.e2e-spec.ts 开头）。
       temperature: options?.temperature ?? 0,
       max_tokens: this.config.maxTokens,
       stream,

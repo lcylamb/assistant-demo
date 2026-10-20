@@ -47,9 +47,19 @@ import { asResult, parseSse } from './support/sse.js';
  *
  * ── 每条用例都跑两条端点 ──
  *
- * `/assistant/ask` 和 `/assistant/askStream` 各打一次，断言 `done.data` 与非流式结果
- * **完全相等**、增量吐出的字和最终结论**逐字相同**。不加这一层的话，前面所有保证
- * 就只对「用户实际在用的那条路之外的那条」成立。
+ * `/assistant/ask` 和 `/assistant/askStream` 各打一次，**两条都各自过一遍结构底线和语义断言**。
+ * 两条跨调用的关系按 provider 分开断言：
+ *
+ *   · mock（规则表，确定性的）：两次调用的结果必须逐字节相等。这条抓的是
+ *     「两条端点共用的 prepare/settle 漂移了」—— 只有确定性 provider 才证得了。
+ *   · 真模型：**不**比两次调用的文本。实测温度 0 也不是确定的：同一请求连问三次，
+ *     两次逐字相同、一次换了说法；E01 的结论一字不差，evidence 却一次一个字段、
+ *     一次两个。拿两次独立采样做全等，红的是骰子，不是代码。
+ *
+ * 跨任何 provider 都成立的结构断言只有一条流内部的：**增量吐出的字必须等于
+ * 这次流自己的 `done.conclusion`**。它不涉及第二次调用，锁的是增量解析器本身。
+ * 早先这里写成了「增量 vs 非流式那次调用的结论」，在 mock 上碰巧一直成立，
+ * 接真模型当天就红了 —— 而管道其实是好的。
  *
  * ── 顺带算一个幻觉率 ──
  *
@@ -133,10 +143,14 @@ interface EvalCase {
   /** 通用期望表达不了的检查，返回发现的问题（空数组 = 没问题） */
   check?: (result: AskResult, row: RowData) => string[];
   /**
-   * 已知答不了，写清为什么。答错不算失败；但如果哪天答对了，
-   * 用例会失败并要求把这一行删掉。
+   * 已知答不了，写清**是谁**答不了。
+   *
+   * ⚠️ 它是 provider 的属性，不是用例的属性：同一张单子 mock 会踩坑，真模型可能答对。
+   * 早先这里只是一个字符串，结果在真模型上跑时那两条「已知不足」都被答对了，
+   * 评测反过来要求把标记删掉 —— 可标记对 mock 仍然成立。
+   * 所以必须带上 provider 名字，只在自己那个 provider 下生效。
    */
-  knownGap?: string;
+  knownGap?: { provider: string; reason: string };
 }
 
 const CASES: EvalCase[] = [
@@ -206,11 +220,18 @@ const CASES: EvalCase[] = [
     id: 'E06',
     code: 'BX-2026-0002',
     question: '这笔钱都花在哪些项目上？',
-    focus: '能答：多明细 + 合计',
-    expect: () => ({
+    focus: '能答：多明细逐条列出',
+    expect: (row) => ({
       insufficient: false,
-      mustMention: ['机械键盘'],
-      evidenceIncludes: ['items', 'amount'],
+      // 每条明细都点到名 —— 明细名从库里取，不手写。
+      mustMention: row.itemNames,
+      // 引用 `items[0].name` 和引用 `items` 一样有效，见 evidenceCovers。
+      //
+      // 这里**不**要求 `amount`：用户问的是「哪些项目」，总结金额是加分项不是必需项。
+      // 原来要求它是照着 mock 的输出写的 —— mock 的那条规则里永远带一句「合计」。
+      // 真模型答了三条明细、没提总额，被这条判成「依据里缺少 amount」，
+      // 但那是评测在替用户加需求。
+      evidenceIncludes: ['items'],
     }),
   },
   {
@@ -230,9 +251,12 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0006',
     question: '费用发生的日期是哪天？',
     focus: '陷阱：费用发生日 vs 提交日',
-    knownGap:
-      'mock 的「时间」规则命中的是 submittedAt，把整单提交日当成了费用发生日。' +
-      '真实模型也很容易踩这个坑（问题是「费用发生」，答案的关键在明细的 spentOn 上）',
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 的「时间」规则命中的是 submittedAt，把整单提交日当成了费用发生日。' +
+        '真实模型也很容易踩这个坑（问题是「费用发生」，答案的关键在明细的 spentOn 上）',
+    },
     expect: () => ({ insufficient: false }),
     check: (result, row) => {
       const hit = row.spentDateVariants.some((date) => mentionsDate(result.conclusion, date));
@@ -257,10 +281,13 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0007',
     question: '这笔费用的发票号是多少？',
     focus: '数据里根本没有这个维度',
-    knownGap:
-      'mock 没有任何规则命中，会退回「总结这张单」并声称 insufficient: false —— ' +
-      '它答了另一个问题，而且不承认自己不知道。真实性（知道自己不知道）' +
-      '是换成真模型之后最该盯的一条',
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 没有任何规则命中，会退回「总结这张单」并声称 insufficient: false —— ' +
+        '它答了另一个问题，而且不承认自己不知道。真实性（知道自己不知道）' +
+        '是换成真模型之后最该盯的一条',
+    },
     expect: () => ({ insufficient: true }),
   },
 ];
@@ -328,16 +355,36 @@ function semanticProblems(c: EvalCase, result: AskResult, row: RowData): string[
     }
   }
   for (const field of expected.evidenceIncludes ?? []) {
-    if (!result.evidence.includes(field)) problems.push(`依据里缺少 ${field}`);
+    if (!evidenceCovers(result.evidence, field)) problems.push(`依据里缺少 ${field}`);
   }
   for (const field of expected.evidenceExcludes ?? []) {
-    if (result.evidence.includes(field)) {
+    if (evidenceCovers(result.evidence, field)) {
       problems.push(`依据里不该有 ${field}（数据里没有这一项）`);
     }
   }
 
   problems.push(...(c.check?.(result, row) ?? []));
   return problems;
+}
+
+/**
+ * `evidence` 里有没有「覆盖到」某个字段路径。
+ *
+ * 为什么不是全等：`availableFields` 是由数据**遍历**出来的（见 expense-context.ts），
+ * 数组既给出 `items`，也给出 `items[0].name`。模型引用后者比引用前者**更精确**，
+ * 没有理由不认。
+ *
+ * 实测真模型在多明细那两条用例上就是这么答的（`items[0].name`、`items[0].amount`），
+ * 而评测原来只认顶层 `items` 这个字符串 —— 于是把更细的引用判成了「缺少依据」。
+ * 那不是模型的问题，是断言按 mock 的写法写死了。
+ */
+function evidenceCovers(evidence: string[], field: string): boolean {
+  return evidence.some(
+    (item) =>
+      item === field ||
+      item.startsWith(`${field}.`) ||
+      item.startsWith(`${field}[`),
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -462,13 +509,18 @@ interface CaseResult {
 }
 
 describe('评测集 (e2e)', () => {
-  let app: NestExpressApplication;
+  let app: NestExpressApplication | undefined;
   let rows: Map<string, RowData>;
   const results: CaseResult[] = [];
   const warnMessages: string[] = [];
-  let warnSpy: MockInstance;
+  let warnSpy: MockInstance | undefined;
   /** 这一轮是谁在答。印在报告里 —— 没有它，两份报告没法比。 */
   let providerName = '';
+  /**
+   * 这个 provider 的输出是不是**逐字节可复现**的。
+   * 只有确定性的 provider 才能断言「两次调用结果全等」（见文件头）。
+   */
+  let deterministic = false;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -480,6 +532,8 @@ describe('评测集 (e2e)', () => {
     await app.init();
 
     providerName = app.get<LlmProvider>(LLM_PROVIDER).name;
+    // 规则表没有随机性，真模型有 —— 这条不是配置，是事实，所以写死在这里。
+    deterministic = providerName === 'mock';
 
     const prisma = app.get(PrismaService);
     const expenses = await prisma.expense.findMany({
@@ -503,13 +557,15 @@ describe('评测集 (e2e)', () => {
   });
 
   afterAll(() => {
-    printReport(results, warnMessages, providerName);
-    warnSpy.mockRestore();
-    return app.close();
+    printReport(results, warnMessages, providerName, deterministic);
+    // `beforeAll` 失败时这两个都可能没建起来 —— 原来的写法会在那里再抛一个
+    // `Cannot read properties of undefined`，把真正的失败盖掉。
+    warnSpy?.mockRestore();
+    return app?.close();
   });
 
   const ask = (body: object) =>
-    request(app.getHttpServer()).post('/assistant/ask').send(body);
+    request(app!.getHttpServer()).post('/assistant/ask').send(body);
 
   it('预检：期望里手写的关键词，必须先证明它真的在数据里', () => {
     // 这是整个文件里最该有的一条。`mustMention` 里的字符串是我手写的，
@@ -550,17 +606,18 @@ describe('评测集 (e2e)', () => {
     const awaited = (await ask(body).expect(200)).body as AskResult;
 
     // ── 流式 ──
-    const streamed = (
-      await request(app.getHttpServer()).post('/assistant/askStream').send(body).expect(200)
+    const streamedBody = (
+      await request(app!.getHttpServer()).post('/assistant/askStream').send(body).expect(200)
     ).text;
-    const frames = parseSse(streamed);
+    const frames = parseSse(streamedBody);
     const done = frames.find((frame) => frame.event === 'done');
     const deltas = frames
       .filter((frame) => frame.event === 'delta')
       .map((frame) => frame.data.text as string);
+    const viaStream = done ? asResult(done) : undefined;
 
     // 两类问题分开记，因为它们的「可豁免性」不同：
-    //   · 结构底线（依据里有编的字段、两条端点漂移、增量对不上）——**永远算失败**。
+    //   · 结构底线（依据里有编的字段、端点漂移、增量对不上）——**永远算失败**。
     //     这些不是「模型答得不好」，是管道坏了。
     //   · 结论的语义（该不该说信息不足、答没答到点上）—— knownGap 豁免的就是这一类。
     //
@@ -570,20 +627,35 @@ describe('评测集 (e2e)', () => {
     const structural = structuralProblems(awaited, row!.context);
     const problems = semanticProblems(c, awaited, row!);
 
-    if (!done) {
+    if (!done || !viaStream) {
       structural.push(
         `流式端点没有给出 done 帧（收到的事件：${frames.map((f) => f.event).join(', ')}）`,
       );
-    } else if (JSON.stringify(asResult(done)) !== JSON.stringify(awaited)) {
-      // 两条端点共用一个 prepare() 和一套收口。这条一旦响，说明它们漂移了。
-      structural.push('流式端点的结论和非流式不一致');
+    } else {
+      // 流式这条端点**自己**也要过一遍结构底线和语义断言。
+      // 只拿它和非流式比全等的话，在真模型上什么也比不出来（见文件头）。
+      structural.push(
+        ...structuralProblems(viaStream, row!.context).map((p) => `流式端点：${p}`),
+      );
+      for (const problem of semanticProblems(c, viaStream, row!)) {
+        // 同一个问题两条端点上都有时只说一次；只有流式那条坏掉时标出来。
+        if (!problems.includes(problem)) problems.push(`流式端点：${problem}`);
+      }
+
+      // 两条端点共用一个 prepare() 和一套收口。这条抓的是「它们漂移了」——
+      // 但只有确定性 provider 才证得了：真模型下这是两次独立采样，
+      // 全等断言红的是骰子。真模型那一路的等价保证由上面的「各自过一遍」承担。
+      if (deterministic && JSON.stringify(viaStream) !== JSON.stringify(awaited)) {
+        structural.push('流式端点的结果和非流式不一致');
+      }
     }
 
+    // 增量 vs **这次流自己的**最终结论。trimEnd 是因为 parseAnswer 会对 conclusion
+    // 做 trim()，差值只可能出现在末尾空白。
     const joined = deltas.join('').trimEnd();
-    if (joined !== awaited.conclusion) {
-      // trimEnd 是因为 parseAnswer 会对 conclusion 做 trim()，差值只可能在末尾空白。
+    if (viaStream && joined !== viaStream.conclusion) {
       structural.push(
-        `增量吐出的字和最终结论对不上（增量 ${joined.length} 字 / 最终 ${awaited.conclusion.length} 字）`,
+        `增量吐出的字和本次流的最终结论对不上（增量 ${joined.length} 字 / 最终 ${viaStream.conclusion.length} 字）`,
       );
     }
 
@@ -591,8 +663,11 @@ describe('评测集 (e2e)', () => {
       .slice(warnedBefore)
       .some((message) => message.includes(HALLUCINATION_WARN));
 
+    // knownGap 只在自己那个 provider 下生效 —— 已知不足是 provider 的属性。
+    const gap = c.knownGap?.provider === providerName ? c.knownGap : undefined;
+
     const verdict =
-      structural.length > 0 || (problems.length > 0 && !c.knownGap)
+      structural.length > 0 || (problems.length > 0 && !gap)
         ? 'fail'
         : problems.length > 0
           ? 'known-gap'
@@ -605,17 +680,17 @@ describe('评测集 (e2e)', () => {
       verdict,
       problems,
       structural,
-      knownGap: c.knownGap,
-      chars: [joined.length, awaited.conclusion.length],
+      knownGap: gap?.reason,
+      chars: [joined.length, viaStream?.conclusion.length ?? 0],
       hallucinated,
     });
 
-    if (c.knownGap && structural.length === 0) {
+    if (gap && structural.length === 0) {
       // 已知不足哪天不红了，就是被修好了（或者被绕过去了）——
       // 两种情况都得回来看一眼，不能让它一直挂着当免罪符。
       expect(
         problems.length,
-        `「${c.focus}」已经不红了，把这条用例的 knownGap 删掉`,
+        `「${c.focus}」在 ${providerName} 上已经不红了，把这条用例的 knownGap 删掉`,
       ).toBeGreaterThan(0);
     } else {
       // 结构问题一并当成失败报出来。
@@ -624,10 +699,23 @@ describe('评测集 (e2e)', () => {
   });
 
   describe('防线自检：故意让模型编一个字段', () => {
-    it('编出来的字段会被剔除，请求本身仍然成功', async () => {
+    /**
+     * 这两条**只在 mock 下有意义**：它们靠 `MOCK_MISBEHAVE=unknown-field` 让假模型
+     * 故意多引用一个不存在的字段。真模型不认这个环境变量，所以在那一路必然红 ——
+     * 而且红得没有任何信息量（防线根本没被喂到幻觉）。
+     *
+     * 跳过是显式的，报告里也会说「这一轮没跑」：不能让一条自检悄悄消失，
+     * 否则「防线还活着」这件事就只剩 mock 那一轮的证据，却没人知道。
+     */
+    const requiresMock = (ctx: { skip: () => void }) => {
+      if (providerName !== 'mock') ctx.skip();
+    };
+
+    it('编出来的字段会被剔除，请求本身仍然成功', async (ctx) => {
       // 这条不是在测模型，是在测**防线本身还活着**。
       // 前面十条用例全绿也可能是「防线根本没被触发过」，
       // 只有主动喂一次幻觉，才能证明它真的会拦。
+      requiresMock(ctx);
       process.env.MOCK_MISBEHAVE = 'unknown-field';
       try {
         const result = (
@@ -641,7 +729,8 @@ describe('评测集 (e2e)', () => {
       }
     });
 
-    it('剔除这件事留下了日志 —— 幻觉率就是数它', () => {
+    it('剔除这件事留下了日志 —— 幻觉率就是数它', (ctx) => {
+      requiresMock(ctx);
       expect(
         warnMessages.some((message) => message.includes(HALLUCINATION_WARN)),
       ).toBe(true);
@@ -683,6 +772,7 @@ function printReport(
   results: CaseResult[],
   warnMessages: string[],
   providerName: string,
+  deterministic: boolean,
 ): void {
   const columns = [
     { title: '用例', width: 6 },
@@ -700,7 +790,13 @@ function printReport(
   );
   // 跑的是规则表就得说出来。同一张全绿的表，一个是「模型答得准」，
   // 另一个只是「规则表按预期执行了」—— 两者的含义差着一个量级。
-  if (providerName === 'mock') {
+  if (!deterministic) {
+    console.log(
+      'ℹ️ 真模型在同一请求上不是逐字确定的（温度 0 也只是降低随机性）。' +
+        '所以跨端点只断言语义，不比对两次调用的文本。',
+    );
+    console.log('ℹ️ 防线自检本轮未运行：它靠 MOCK_MISBEHAVE 注入幻觉，只有 mock 认这个变量。');
+  } else {
     console.log('⚠️ 这一轮是规则表在答，不是模型。它证明的是评测本身有效，不是模型答得准。');
   }
   console.log(header);
