@@ -22,11 +22,14 @@ describe('应用外壳 (e2e)', () => {
     await app.close();
   });
 
-  it('GET /health 活着', () => {
-    return request(app.getHttpServer())
+  it('GET /health 活着，并且数据库真的可达', async () => {
+    // `db: 'ok'` 不是装饰：这条路由会真的发一条 `select 1`，
+    // 「进程活着」和「服务能用」在这个项目里是同一个问题（见 app.controller.ts）。
+    const response = await request(app.getHttpServer())
       .get('/health')
-      .expect(200)
-      .expect({ status: 'ok' });
+      .expect(200);
+
+    expect(response.body).toEqual({ status: 'ok', db: 'ok' });
   });
 
   it('GET / 交给静态演示页，而不是 Nest 路由', async () => {

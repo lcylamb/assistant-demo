@@ -55,6 +55,11 @@ function p1001(): Prisma.PrismaClientKnownRequestError {
  */
 function outagePrisma(where: 'prepare' | 'tool'): PrismaService {
   return {
+    // 探活走 `$queryRaw`。不管挂在哪个阶段，库都是同一个库，
+    // 所以这里也抛 P1001 —— 『探活会跟着一起红』本身就是这条用例要证明的事。
+    $queryRaw: async () => {
+      throw p1001();
+    },
     expense: {
       findUnique: async ({ select }: { select?: Record<string, boolean> }) => {
         if (where === 'prepare' || !select?.id) throw p1001();
@@ -140,6 +145,16 @@ describe('取单号时库连不上 (e2e)', () => {
 
     expect(response.headers['content-type']).toContain('application/json');
     expect(response.body.message).toBe(UNAVAILABLE);
+  });
+
+  it('探活也跟着红：库连不上时 /health 必须 503', async () => {
+    // 这条和上面两条测的是同一次故障的不同读者：上面是用户，这里是平台。
+    // 探活如果只回 `ok`，平台永远看不到这次故障 —— 监控全绿、用户全在报错。
+    const response = await request(app.getHttpServer())
+      .get('/health')
+      .expect(503);
+
+    expect(response.body).toEqual({ status: 'error', db: 'down' });
   });
 });
 

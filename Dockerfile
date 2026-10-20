@@ -103,6 +103,8 @@ EXPOSE 3100
 
 # 探活直接问应用自己的 /health，而不是只查端口通不通 ——
 # 端口开着但数据库连不上时，后者会一直报健康。
+# /health 内部会真的发一条 `select 1`（2s 上限，见 src/app.controller.ts），
+# 所以这里的 3s 超时必须比它长，否则先到的永远是探针自己的超时。
 #
 # 用 node 自带的 fetch 而不是 curl：alpine 镜像里没有 curl，
 # 为了一个探针去 apk add 一个包不划算；Node 20 有全局 fetch。
