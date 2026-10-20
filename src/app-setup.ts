@@ -1,6 +1,7 @@
 import { ValidationPipe, type NestApplicationOptions } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'node:path';
+import { accessLogMiddleware } from './access-log.js';
 import { RequestIdLogger, requestIdMiddleware } from './request-context.js';
 
 /**
@@ -44,6 +45,10 @@ export function applyGlobalSetup(app: NestExpressApplication): void {
   // 这也是为什么只在 setup 里换一次就够，不用每个 service 各传一个。
   app.use(requestIdMiddleware);
   app.useLogger(new RequestIdLogger());
+
+  // 访问日志紧跟在请求 id 之后：它靠 `currentRequestId()` 取 id，
+  // 排在前面就永远拿不到。
+  app.use(accessLogMiddleware);
 
   app.useGlobalPipes(
     new ValidationPipe({

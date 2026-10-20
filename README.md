@@ -187,6 +187,33 @@ DATABASE_URL=postgresql://demo:demo@db:5432/assistant_demo?schema=public
 换成**全局**日志器 —— 模块里那些 `new Logger(...)` 因此都自动经过它，不用每个 service 各传一个。
 `test/app.e2e-spec.ts` 钉住三条：没传时生成一个、合法时原样回显、不合法时换掉。
 
+### 访问日志：每个请求一行
+
+请求 id 只是把**已经打出来**的日志串起来；业务日志是稀疏的，一次成功的提问可能一行都没有，
+「刚才那次很慢」在日志里就对不上任何东西。所以每个请求结束补一行：
+
+```
+[req 6f1c…] GET /assistant/metrics 200 12ms
+[req 9a2b…] POST /assistant/askStream 200 1834ms（流式）
+[req c3d4…] POST /assistant/askStream 客户端断开 812ms
+```
+
+三个决定都不是随手写的：
+
+- **只记 `/assistant/*` 的成功请求，以及任何路径上的失败。** 平台每 30 秒打一次 `/health`，
+  静态资源更密 —— 全记的话日志里九成是噪音。但 4xx/5xx 不分路径：404 扫描和限流打回来的
+  请求，恰恰是最需要看见的那些。
+- **断开用 `writableFinished` 判，不看状态码。** 客户端掐断连接时 `finish` 不会触发、
+  `close` 会，而状态码还停在 200 —— 照抄它就会把一次中断记成成功。
+- **时间从请求进入中间件开始算，到响应写完为止。** 流式那一行因此是**整条流**的耗时，
+  和普通接口的一次往返不是一个量级，所以单独标了「（流式）」。这也是业务打点没有的信息：
+  它只记模型侧，不含排队、序列化和客户端读取。
+
+`finish` 和 `close` 都会挂上，但只写一行（`src/access-log.ts` 里的 `written` 标志）。
+另外，这两个事件未必在请求的异步上下文里触发，而日志前缀靠的是 `AsyncLocalStorage` ——
+所以中间件一开始就把 id 抓在手里，写日志时再显式带一次。`test/access-log.e2e-spec.ts`
+用真实 socket 验证了这一点：流式成功和客户端断开的两行，都能和响应头里的 id 对上。
+
 ### 部署到公网
 
 部署目标是 **Render + Neon**（都免费、不用绑卡）：Render 直接拿仓库里的 `Dockerfile` 构建，Neon 提供托管 Postgres。
