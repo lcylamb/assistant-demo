@@ -30,6 +30,115 @@ export interface ExpenseContext {
  *    直接 JSON.stringify 会变成一个 `{s,e,d}` 的结构体，模型看不懂。
  *    用 toFixed(2) 保证 `2766.00` 而不是 `2766` —— 金额的小数位是信息的一部分。
  */
+/** Prisma Decimal 的最小形状。工具用 `select` 只取部分列，不能要求完整实体类型。 */
+interface DecimalLike {
+  toFixed(digits: number): string;
+}
+
+interface HeaderFields {
+  code: string;
+  title: string;
+  applicant: string;
+  department: string;
+  category: string;
+  amount: DecimalLike;
+  status: string;
+  submittedAt: Date;
+}
+
+interface ItemFields {
+  name: string;
+  category: string;
+  amount: DecimalLike;
+  spentOn: Date;
+  note: string | null;
+}
+
+interface ItemsFields {
+  code: string;
+  amount: DecimalLike;
+  items: ItemFields[];
+}
+
+/**
+ * 主表字段。**不含**审批信息 —— 审批是另一个工具的事。
+ * 这个切分不是为了好看：它让「模型只查了表头却引用 rejectReason」变成一件可检测的事。
+ */
+export function buildExpenseHeader(
+  expense: HeaderFields,
+): Record<string, unknown> {
+  return {
+    code: expense.code,
+    title: expense.title,
+    applicant: expense.applicant,
+    department: expense.department,
+    category: expense.category,
+    amount: expense.amount.toFixed(2),
+    status: expense.status,
+    submittedAt: expense.submittedAt.toISOString(),
+  };
+}
+
+/**
+ * 审批记录。可空字段只在有值时出现 —— 理由同 `buildExpenseContext` 的第 1 条：
+ * 「数据里没有」和「模型编了一个」必须在字段层面分得开。
+ *
+ * 参数只要求这几个字段，而不是整条 `ExpenseWithItems`：审批工具只 `select` 了这一组列，
+ * 用一个「完整实体」类型会逼调用方造假的占位字段 —— 那比少一个字段更容易出错。
+ */
+interface ApprovalFields {
+  code: string;
+  status: string;
+  decidedAt: Date | null;
+  rejectReason: string | null;
+}
+
+export function buildApprovalRecord(
+  expense: ApprovalFields,
+): Record<string, unknown> {
+  const record: Record<string, unknown> = {
+    code: expense.code,
+    status: expense.status,
+  };
+  if (expense.decidedAt) record.decidedAt = expense.decidedAt.toISOString();
+  if (expense.rejectReason) record.rejectReason = expense.rejectReason;
+  return record;
+}
+
+/**
+ * 明细。**连合计一起给**：合计是明细之和的投影，用户问「都花在哪些项目上」时
+ * 它几乎是必然要说的，硬把它留给另一个工具只会逼模型再查一次（或者干脆编一个数）。
+ */
+export function buildExpenseItems(
+  expense: ItemsFields,
+): Record<string, unknown> {
+  return {
+    code: expense.code,
+    amount: expense.amount.toFixed(2),
+    items: itemRecords(expense.items),
+  };
+}
+
+function itemRecords(items: ItemFields[]): Array<Record<string, unknown>> {
+  return items.map((item) => {
+    const row: Record<string, unknown> = {
+      name: item.name,
+      category: item.category,
+      amount: item.amount.toFixed(2),
+      spentOn: item.spentOn.toISOString(),
+    };
+    if (item.note) row.note = item.note;
+    return row;
+  });
+}
+
+/** 一个记录里所有可引用的字段路径。工具和整页 context 共用这一份规则。 */
+export function fieldsOf(record: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  collectPaths(record, '', out);
+  return out;
+}
+
 export function buildExpenseContext(expense: ExpenseWithItems): ExpenseContext {
   const record: Record<string, unknown> = {
     code: expense.code,
@@ -40,25 +149,13 @@ export function buildExpenseContext(expense: ExpenseWithItems): ExpenseContext {
     amount: expense.amount.toFixed(2),
     status: expense.status,
     submittedAt: expense.submittedAt.toISOString(),
-    items: expense.items.map((item) => {
-      const row: Record<string, unknown> = {
-        name: item.name,
-        category: item.category,
-        amount: item.amount.toFixed(2),
-        spentOn: item.spentOn.toISOString(),
-      };
-      if (item.note) row.note = item.note;
-      return row;
-    }),
+    items: itemRecords(expense.items),
   };
 
   if (expense.decidedAt) record.decidedAt = expense.decidedAt.toISOString();
   if (expense.rejectReason) record.rejectReason = expense.rejectReason;
 
-  const availableFields: string[] = [];
-  collectPaths(record, '', availableFields);
-
-  return { record, availableFields };
+  return { record, availableFields: fieldsOf(record) };
 }
 
 /**

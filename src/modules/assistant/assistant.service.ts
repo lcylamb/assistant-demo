@@ -13,50 +13,40 @@ import {
   LLM_PROVIDER,
   type LlmMessage,
   type LlmProvider,
+  type LlmToolCall,
 } from '../llm/llm.types.js';
 import type { AskDto } from './ask.dto.js';
-import type { AskResult, AssistantStreamEvent } from './ask.types.js';
-import { buildExpenseContext, type ExpenseContext } from './expense-context.js';
+import type {
+  AgentStep,
+  AskResult,
+  AssistantStreamEvent,
+  ParsedAnswer,
+} from './ask.types.js';
 import { parseAnswer } from './parse-answer.js';
 import { partialConclusion } from './stream-parse.js';
+import { TOOL_SPECS, findTool, type ToolOutcome } from './tools.js';
 
 /**
  * 系统提示词。
  *
- * 三条约束各自对应代码里的一个动作，不是随便写的客气话：
- *   · 第 1、2 条 → 模型若违反，evidence 里会出现 availableFields 之外的字段，
- *                  `dropUnknownEvidence` 会把它抓出来
- *   · 第 3 条   → 对应 insufficient 这个字段，也是「数据里没有」和「模型不知道」
- *                  在接口层面被分开的原因
- *   · 第 4 条   → 对应 parseAnswer；写成只输出 JSON，就不用在解析器里处理
- *                  长篇自然语言里夹带 JSON 的花样
+ * 和「把数据塞进 prompt」那一版相比，多出来的第 1 条是这次改造的核心：
+ * **数据不在 prompt 里，模型要靠工具去拿**。这句话必须写，否则模型会凭常识编。
+ *
+ * 三条约束各自对应代码里的一个动作：
+ *   · 第 2 条 → `dropUnknownEvidence`：引用了本次**没查过**的字段就剔除并记 warn
+ *   · 第 3 条 → 对应 insufficient，也是「数据里没有」和「模型不知道」在接口层面分开的原因
+ *   · 第 4 条 → 对应 parseAnswer；写成只输出 JSON，就不用在解析器里处理长篇小说
  */
 const SYSTEM_PROMPT = `你是一个报销单查询助手。
 
 规则：
-1. 只能依据「报销单数据」里出现过的事实回答。不要推测，不要补充数据里没有的内容。
-2. 回答引用的每一个字段，都必须来自「可引用字段」清单，不要自己发明字段名。
-3. 数据不足以回答问题时，把 insufficient 设为 true，并在 conclusion 里说清楚缺什么。
-4. 只输出一个 JSON 对象。不要写解释，不要加 Markdown 代码块。
+1. 你看不到报销单数据本身。需要什么就调用工具去查，不要凭常识推测。
+2. 回答引用的每一个字段，都必须来自工具本次返回过的字段路径（例如 items[0].name）。
+3. 工具返回的数据不足以回答问题时，把 insufficient 设为 true，并在 conclusion 里说清楚缺什么。
+4. 拿到数据后，只输出一个 JSON 对象。不要写解释，不要加 Markdown 代码块。
 
 输出格式：
 {"conclusion": "一句话结论（中文）", "evidence": ["用到的字段路径"], "insufficient": false}`;
-
-/**
- * 一次提问的「上半场」：取数、摊平、组 prompt。
- *
- * 单独成型的理由是**两条端点必须共用它**。`ask()` 和 `askStream()` 各自组一遍
- * prompt 的话，两边会慢慢长歪 —— 而症状是「流式和非流式答得不一样」，
- * 这种 bug 极难查，因为两边单看都「能跑」。
- *
- * 它还顺带解决一个时序问题：取数会抛 404，**必须在 SSE 的响应头写出去之前完成**。
- * 头一发，就再也没法返回一个正常的 JSON 错误了。
- */
-export interface PreparedAsk {
-  code: string;
-  availableFields: string[];
-  messages: LlmMessage[];
-}
 
 /**
  * 幻觉告警的固定开头。
@@ -77,6 +67,32 @@ export const HALLUCINATION_WARN = '模型引用了不存在的字段';
  */
 const QUOTA_MESSAGE = '今天的演示额度用完了，明天再来。';
 
+/**
+ * 一次提问最多允许几轮「模型调工具 → 我们回结果」。
+ *
+ * 有上限不是怕模型笨，是怕它**循环**：一旦模型每次都要求调工具、每次都拿不到想要的东西，
+ * 没有上限的话这个请求会一直烧 token 直到超时。4 轮对三类问题绰绰有余
+ * （实测最多 2 轮：一轮并行调 2~3 个工具，第二轮出答案）。
+ */
+const MAX_TOOL_STEPS = 4;
+
+/**
+ * 一次提问的会话状态。
+ *
+ * 为什么不是把数据放进 prompt：`expenseId` 是**服务端绑定**的，模型碰不到。
+ * 工具只拿得到它，所以模型能查的范围由这次请求决定，不能由它的输出决定。
+ *
+ * `fields` 是本次**实际查过**的字段路径集合，防幻觉的白名单从它来 ——
+ * 不再是「这张单子有哪些字段」，而是「模型这次真的看过哪些字段」。
+ * 后者更严：它连「没查就敢引用」也拦得住。
+ */
+export interface AgentSession {
+  code: string;
+  expenseId: string;
+  messages: LlmMessage[];
+  fields: Set<string>;
+}
+
 @Injectable()
 export class AssistantService {
   private readonly logger = new Logger(AssistantService.name);
@@ -90,36 +106,41 @@ export class AssistantService {
   /**
    * 问一句，拿回结构化答案。
    *
-   * 五个步骤，每一步都对应一个可能出错的地方，且错的种类不同：
-   *   取数（单号不存在）→ 组 prompt（不涉及失败）→ 调用（网络/鉴权/额度）
-   *   → 解析（模型没按格式答）→ 字段校验（模型编了字段）
-   * 前四种各有各的异常，最后一种只记日志 —— 理由见 dropUnknownEvidence。
+   * 每一轮模型调用都是一次「它自己决定下一步」：要工具就调，不要就收口。
+   * 失败的种类仍然分得开 —— 取数（404）、额度（429）、模型/厂商（502）、
+   * 格式（502，但日志里写着原因）。
    */
   async ask(dto: AskDto): Promise<AskResult> {
-    const prepared = await this.prepare(dto);
-    this.assertQuota();
+    const session = await this.prepare(dto);
+    const trace: AgentStep[] = [];
 
-    let completion;
-    try {
-      completion = await this.llm.complete(prepared.messages);
-    } catch (error) {
-      // ⚠️ 这一层在接真模型之前是**不需要**的，因为假模型不会失败。
-      // 真实厂商会：密钥过期、余额用尽、超时、502。不接住的话它变成一个 500，
-      // 而 500 的语义是「服务端有 bug」—— 上游看到就会去翻代码，方向从一开始就错了。
-      // 这是「别人的服务不可用」，是 502。
-      this.logger.error(
-        `调用模型失败（${this.llm.name}）：${error instanceof Error ? error.message : String(error)}`,
-      );
-      throw new BadGatewayException('模型调用失败，请重试');
+    for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
+      this.assertQuota();
+
+      let completion;
+      try {
+        completion = await this.llm.complete(session.messages, {
+          tools: TOOL_SPECS,
+        });
+      } catch (error) {
+        this.logModelFailure(error);
+        throw new BadGatewayException('模型调用失败，请重试');
+      }
+
+      if (completion.toolCalls.length === 0) {
+        this.logger.log(
+          `[${this.llm.name}] ${completion.model} 回答 ${dto.code}` +
+            `（${completion.text.length} 字，工具 ${trace.length} 次）`,
+        );
+        const result = this.settle(completion.text, session);
+        if (!result.ok) throw new BadGatewayException(result.message);
+        return { ...result.value, trace };
+      }
+
+      await this.executeToolCalls(session, completion.text, completion.toolCalls, trace);
     }
 
-    this.logger.log(
-      `[${this.llm.name}] ${completion.model} 回答 ${dto.code}（${completion.text.length} 字）`,
-    );
-
-    const result = this.settle(completion.text, prepared, dto.code);
-    if (!result.ok) throw new BadGatewayException(result.message);
-    return result.value;
+    throw new BadGatewayException('模型反复调用工具，已停止');
   }
 
   /**
@@ -127,103 +148,218 @@ export class AssistantService {
    *
    * ⚠️ 这是**服务层**，它不知道 SSE 长什么样 —— 它只 yield 事件。
    * `event:` / `data:` 这些分帧语法是 HTTP 的事，归 controller 管。
-   * 混在一起的话，将来想在 WebSocket 上复用这条流，就得把 HTTP 的东西撕出来。
+   *
+   * 和 `ask()` 是同一个循环，只是每轮换成流式读。文本一边到一边往外吐；
+   * 工具调用是攒齐了才执行（碎片没法执行），执行完进入下一轮。
    */
   async *streamAnswer(
-    prepared: PreparedAsk,
+    session: AgentSession,
     signal?: AbortSignal,
   ): AsyncGenerator<AssistantStreamEvent> {
-    let buffer = '';
+    const trace: AgentStep[] = [];
     let emitted = '';
 
-    // 额度检查在**这里**，不能像 ask() 那样抛异常：controller 早就把 SSE 的
-    // 响应头发给浏览器了，那时再抛只会把连接搞断，用户什么也看不到。
-    // 所以超限的表示方式是流里的一个 error 事件 —— 前端已经会渲染它。
-    if (!this.quota.consume()) {
-      yield { type: 'error', message: QUOTA_MESSAGE };
-      return;
-    }
-
-    try {
-      const stream = await this.llm.stream(prepared.messages, { signal });
-
-      for await (const chunk of stream.chunks) {
-        buffer += chunk;
-
-        const partial = partialConclusion(buffer);
-
-        // 理论上前缀关系必然成立（重扫是幂等的，见 stream-parse.ts）。
-        // 真不成立就说明解析器有 bug —— 宁可不吐，也不能吐错：
-        // 用户看到一段后来被最终结果推翻的字，比晚 50ms 看到更难解释。
-        if (!partial.startsWith(emitted)) {
-          this.logger.warn('增量解析结果不是单调的，本块丢弃（stream-parse 可能有 bug）');
-          continue;
-        }
-
-        if (partial.length > emitted.length) {
-          yield { type: 'delta', text: partial.slice(emitted.length) };
-          emitted = partial;
-        }
+    for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
+      // 额度检查在**这里**，不能像 ask() 那样抛异常：controller 早就把 SSE 的
+      // 响应头发给浏览器了，那时再抛只会把连接搞断，用户什么也看不到。
+      // 所以超限的表示方式是流里的一个 error 事件 —— 前端已经会渲染它。
+      if (!this.quota.consume()) {
+        yield { type: 'error', message: QUOTA_MESSAGE };
+        return;
       }
-    } catch (error) {
-      this.logger.error(
-        `流式调用失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-      yield { type: 'error', message: '模型调用失败，请重试' };
-      return;
+
+      let stream;
+      try {
+        stream = await this.llm.stream(session.messages, {
+          tools: TOOL_SPECS,
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) {
+          this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+          return;
+        }
+        this.logModelFailure(error);
+        yield { type: 'error', message: '模型调用失败，请重试' };
+        return;
+      }
+
+      let text = '';
+      let toolPhase = false;
+      const calls: LlmToolCall[] = [];
+
+      try {
+        for await (const event of stream.events) {
+          if (event.type === 'tool_call') {
+            toolPhase = true;
+            calls.push(event.call);
+            continue;
+          }
+
+          text += event.text;
+
+          // 工具轮里模型偶尔会先说一句人话（jsonMode 关掉时尤其常见）。
+          // 那不是答案，不能往用户那边吐 —— 否则最终结论会和已经显示的字对不上。
+          if (toolPhase) continue;
+
+          const partial = partialConclusion(text);
+
+          // 理论上前缀关系必然成立（重扫是幂等的，见 stream-parse.ts）。
+          // 真不成立就说明解析器有 bug —— 宁可不吐，也不能吐错。
+          if (!partial.startsWith(emitted)) {
+            this.logger.warn('增量解析结果不是单调的，本块丢弃（stream-parse 可能有 bug）');
+            continue;
+          }
+
+          if (partial.length > emitted.length) {
+            yield { type: 'delta', text: partial.slice(emitted.length) };
+            emitted = partial;
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+          return;
+        }
+        this.logModelFailure(error);
+        yield { type: 'error', message: '模型调用失败，请重试' };
+        return;
+      }
+
+      if (signal?.aborted) {
+        this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+        return;
+      }
+
+      if (calls.length === 0) {
+        // ⚠️ 最终结果走的是和非流式**完全相同**的收口逻辑。
+        // 不走这一步的话，增量阶段吐出去的字就成了绕过校验的后门。
+        const result = this.settle(text, session);
+        if (!result.ok) {
+          yield { type: 'error', message: result.message };
+          return;
+        }
+
+        this.logger.log(
+          `流式回答完成 ${session.code}（增量 ${emitted.length} 字，工具 ${trace.length} 次）`,
+        );
+        yield { type: 'done', data: { ...result.value, trace } };
+        return;
+      }
+
+      // 这一轮已经吐出过字的极端情况：模型先说了半句、随后又要调工具。
+      // 已经发出去的字收不回来，只能把 `emitted` 归零，让最终答案还能正常显示；
+      // 代价是页面上可能多出一句前言 —— 记一条 warn，评测那边会用增量断言抓住它。
+      if (emitted !== '') {
+        this.logger.warn(
+          `工具轮里已经向客户端吐出过文本（${emitted.length} 字），最终结论可能与已显示内容不一致`,
+        );
+        emitted = '';
+      }
+
+      await this.executeToolCalls(session, text, calls, trace);
     }
 
-    if (signal?.aborted) {
-      this.logger.log(`客户端已断开，${prepared.code} 的流提前结束`);
-      return;
-    }
-
-    // ⚠️ 最终结果走的是和非流式**完全相同**的收口逻辑。
-    // 不走这一步的话，增量阶段吐出去的字就成了绕过校验的后门：
-    // 用户看到的是没经过格式校验、也没过防幻觉校验的文本。
-    const result = this.settle(buffer, prepared, prepared.code);
-    if (!result.ok) {
-      yield { type: 'error', message: result.message };
-      return;
-    }
-
-    this.logger.log(`流式回答完成 ${prepared.code}（增量 ${emitted.length} 字）`);
-    yield { type: 'done', data: result.value };
-  }
-
-  /** 取数 + 摊平 + 组 prompt。会抛 404，所以必须在写响应头之前调用。 */
-  async prepare(dto: AskDto): Promise<PreparedAsk> {
-    const context = await this.loadContext(dto.code);
-    return {
-      code: dto.code,
-      availableFields: context.availableFields,
-      messages: buildMessages(context, dto.question),
-    };
+    yield { type: 'error', message: '模型反复调用工具，已停止' };
   }
 
   /**
-   * 额度闸。**放在 `prepare()` 之后** —— 顺序是有意义的：
-   * 单号不存在是 404，那次请求根本没碰模型，不该算掉一次额度。
-   * 写反了的话，一个脚本可以拿不存在的单号把当天额度刷光，而它一次模型都没调。
+   * 取数 + 组 prompt。会抛 404，所以必须在写响应头之前调用。
+   *
+   * 这里**只查 id**，不把数据读出来 —— 数据由模型决定要不要查、查哪一块。
+   * 这也顺带把「单号存不存在」和「模型要查什么」两件事分开了：
+   * 前者是请求合法性，必须在流开始前判；后者是模型的决定，发生在流中间。
    */
+  async prepare(dto: AskDto): Promise<AgentSession> {
+    const expense = await this.prisma.expense.findUnique({
+      where: { code: dto.code },
+      select: { id: true },
+    });
+
+    if (!expense) {
+      throw new NotFoundException(`没有找到编号为 ${dto.code} 的报销单`);
+    }
+
+    return {
+      code: dto.code,
+      expenseId: expense.id,
+      messages: buildMessages(dto.code, dto.question),
+      fields: new Set<string>(),
+    };
+  }
+
   private assertQuota(): void {
     if (!this.quota.consume()) {
       throw new HttpException(QUOTA_MESSAGE, HttpStatus.TOO_MANY_REQUESTS);
     }
   }
 
-  /** 取数并摊平。找不到单子就是 404 —— 这不是模型的失败，不该报成 5xx。 */
-  private async loadContext(code: string): Promise<ExpenseContext> {
-    const expense = await this.prisma.expense.findUnique({
-      where: { code },
-      include: { items: { orderBy: { spentOn: 'asc' } } },
-    });
+  /**
+   * 执行一轮工具调用，并把结果写回对话。
+   *
+   * 三件事这里必须做对：
+   *   1. assistant 那条消息要带 `toolCalls` —— 厂商靠它把下一轮的 tool 结果对上号；
+   *   2. 每条结果都带 `toolCallId`，配对依据是 id 不是函数名（并行调同一个工具时，
+   *      光靠名字分不清哪条结果属于哪次调用）；
+   *   3. **无论成功失败都要回一条 tool 消息**。漏掉任何一条，下一轮请求的结构就不完整，
+   *      厂商会直接 400 —— 错误会出现在离病因很远的地方。
+   */
+  private async executeToolCalls(
+    session: AgentSession,
+    text: string,
+    calls: LlmToolCall[],
+    trace: AgentStep[],
+  ): Promise<void> {
+    session.messages.push({ role: 'assistant', content: text, toolCalls: calls });
 
-    if (!expense) {
-      throw new NotFoundException(`没有找到编号为 ${code} 的报销单`);
+    for (const call of calls) {
+      const startedAt = Date.now();
+      const tool = findTool(call.name);
+      let outcome: ToolOutcome;
+
+      if (!tool) {
+        // 模型报了一个不存在的工具名（幻觉的一种）。回告它，别崩。
+        this.logger.warn(`模型请求了不存在的工具：${call.name}`);
+        outcome = {
+          ok: false,
+          payload: { error: `没有名为 ${call.name} 的工具，请使用已有工具或直接说明信息不足` },
+          fields: [],
+        };
+      } else {
+        try {
+          outcome = await tool.run({
+            expenseId: session.expenseId,
+            prisma: this.prisma,
+          });
+        } catch (error) {
+          this.logger.error(
+            `工具 ${call.name} 执行失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+          outcome = {
+            ok: false,
+            payload: { error: '工具执行失败，请换一种方式或直接说明信息不足' },
+            fields: [],
+          };
+        }
+      }
+
+      for (const field of outcome.fields) session.fields.add(field);
+
+      session.messages.push({
+        role: 'tool',
+        toolCallId: call.id,
+        content: JSON.stringify(outcome.payload),
+      });
+
+      trace.push({ tool: call.name, ok: outcome.ok });
+
+      // 打点：工具名、耗时、返回了多少个可引用字段。
+      // 评测不看这几行（它看 trace），排查「怎么答得这么慢」时看它们。
+      this.logger.log(
+        `工具 ${call.name} ${outcome.ok ? '完成' : '失败'}` +
+          `（${Date.now() - startedAt} ms，${outcome.fields.length} 个可引用字段）`,
+      );
     }
-
-    return buildExpenseContext(expense);
   }
 
   /**
@@ -235,9 +371,8 @@ export class AssistantService {
    */
   private settle(
     raw: string,
-    prepared: PreparedAsk,
-    code: string,
-  ): { ok: true; value: AskResult } | { ok: false; message: string } {
+    session: AgentSession,
+  ): { ok: true; value: ParsedAnswer } | { ok: false; message: string } {
     const parsed = parseAnswer(raw);
     if (!parsed.ok) {
       // 把原因和原文一起记下来 —— 只报「格式异常」的话，没法判断是提示词要改
@@ -250,62 +385,60 @@ export class AssistantService {
 
     return {
       ok: true,
-      value: this.dropUnknownEvidence(
-        parsed.value,
-        prepared.availableFields,
-        code,
-      ),
+      value: this.dropUnknownEvidence(parsed.value, session.fields, session.code),
     };
   }
 
   /**
    * 剔除模型编出来的字段路径。
    *
+   * 白名单是**本次实际查过**的字段（session.fields），不是整张单子的字段全集。
+   * 这个区别有意义：模型没查审批记录却引用 `rejectReason`，即使这个字段在库里存在，
+   * 它也是在拿没有依据的东西说话 —— 该被剔掉，并且该记一笔。
+   *
    * 为什么**不**直接报错：字段名里出现一个不存在的路径，说明这句结论很可能站不住，
    * 但它也可能只是顺手多写了一个（真实模型很常见）。为此把整个请求判成失败，
    * 等于让一次措辞瑕疵变成用户看到的错误页。
-   *
-   * 折中是：从 evidence 里剔掉，保证**用户看到的依据一定真实存在**，
-   * 同时在日志里留下 warn —— 评测就靠数这条日志来算幻觉率。
-   *
-   * ⚠️ 诚实边界：剔除只保证 evidence 不撒谎，**不保证 conclusion 因此就对了**。
-   * 结论对不对是评测要回答的问题，不是这道校验能回答的。
    */
   private dropUnknownEvidence(
-    result: AskResult,
-    availableFields: string[],
+    result: ParsedAnswer,
+    known: Set<string>,
     code: string,
-  ): AskResult {
-    const known = new Set(availableFields);
+  ): ParsedAnswer {
     const unknown = result.evidence.filter((field) => !known.has(field));
     if (unknown.length === 0) return result;
 
     this.logger.warn(
       `${HALLUCINATION_WARN}，已剔除：[${unknown.join(', ')}]（单号 ${code}）` +
-        `｜可用字段共 ${availableFields.length} 个`,
+        `｜本次实际查过 ${known.size} 个字段`,
     );
 
     return { ...result, evidence: result.evidence.filter((f) => known.has(f)) };
   }
+
+  private logModelFailure(error: unknown): void {
+    // ⚠️ 这一层在接真模型之前是**不需要**的，因为假模型不会失败。
+    // 真实厂商会：密钥过期、余额用尽、超时、502。不接住的话它变成一个 500，
+    // 而 500 的语义是「服务端有 bug」—— 上游看到就会去翻代码，方向从一开始就错了。
+    this.logger.error(
+      `调用模型失败（${this.llm.name}）：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
-function buildMessages(context: ExpenseContext, question: string): LlmMessage[] {
+/**
+ * 组第一轮对话。
+ *
+ * 这里**没有数据**，只有单号和问题 —— 数据要靠模型自己调工具去拿。
+ * 单号本身是必要的（它让结论能说清「哪张单子」），但不是查询条件：
+ * 工具的范围由服务端绑定，模型改不了。
+ */
+function buildMessages(code: string, question: string): LlmMessage[] {
   return [
     { role: 'system', content: SYSTEM_PROMPT },
     {
       role: 'user',
-      content: [
-        '## 报销单数据',
-        '```json',
-        JSON.stringify(context.record, null, 2),
-        '```',
-        '',
-        '## 可引用字段',
-        context.availableFields.join(', '),
-        '',
-        '## 问题',
-        question,
-      ].join('\n'),
+      content: ['## 报销单单号', code, '', '## 问题', question].join('\n'),
     },
   ];
 }

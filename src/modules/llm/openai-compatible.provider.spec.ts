@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import type { LlmMessage } from './llm.types.js';
+import type { LlmMessage, LlmStreamEvent, LlmToolSpec } from './llm.types.js';
 import {
   OpenAiCompatibleProvider,
   type OpenAiCompatibleConfig,
@@ -103,9 +103,20 @@ function openStream(res: ServerResponse): void {
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
 }
 
-async function drain(chunks: AsyncIterable<string>): Promise<string[]> {
+async function drainEvents(
+  events: AsyncIterable<LlmStreamEvent>,
+): Promise<LlmStreamEvent[]> {
+  const out: LlmStreamEvent[] = [];
+  for await (const event of events) out.push(event);
+  return out;
+}
+
+/** 大多数流式用例只关心文本 —— 工具调用有单独一条用例专门验。 */
+async function drain(events: AsyncIterable<LlmStreamEvent>): Promise<string[]> {
   const out: string[] = [];
-  for await (const chunk of chunks) out.push(chunk);
+  for await (const event of events) {
+    if (event.type === 'text') out.push(event.text);
+  }
   return out;
 }
 
@@ -152,6 +163,9 @@ describe('OpenAiCompatibleProvider', () => {
       expect(await makeProvider(baseUrl).complete(MESSAGES)).toEqual({
         text: '{"conclusion":"好"}',
         model: MODEL,
+        // 纯文本回答也要显式给空数组，不是 undefined ——
+        // 调用方可以无脑读 `completion.toolCalls.length`，不用先判存在。
+        toolCalls: [],
       });
     });
 
@@ -205,6 +219,112 @@ describe('OpenAiCompatibleProvider', () => {
       await expect(makeProvider(baseUrl).complete(MESSAGES)).rejects.toThrow(
         /没有 choices\[0\]\.message\.content/,
       );
+    });
+
+    it('只有 tool_calls、没有文本时算成功 —— 那一轮本来就不该说话', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            model: MODEL,
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      type: 'function',
+                      function: { name: 'get_expense_summary', arguments: '{}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+      });
+
+      // 把「没有 content」一律当成失败，是接工具调用时最典型的错误：
+      // 每一个正常的工具轮都会被误判成厂商异常，而模型其实答得好好的。
+      expect(await makeProvider(baseUrl).complete(MESSAGES)).toEqual({
+        text: '',
+        model: MODEL,
+        toolCalls: [{ id: 'call_1', name: 'get_expense_summary', arguments: '{}' }],
+      });
+    });
+
+    it('工具的定义和上一轮的调用历史按厂商线格式发出去', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: MODEL, choices: [{ message: { content: 'ok' } }] }));
+      });
+
+      const tools: LlmToolSpec[] = [
+        {
+          name: 'get_expense_summary',
+          description: '查表头',
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      ];
+      const history: LlmMessage[] = [
+        { role: 'system', content: 's' },
+        { role: 'user', content: 'q' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'call_1', name: 'get_expense_summary', arguments: '{}' }],
+        },
+        { role: 'tool', toolCallId: 'call_1', content: '{"code":"BX-1"}' },
+      ];
+
+      await makeProvider(baseUrl).complete(history, { tools });
+
+      const [sent] = requests;
+      expect(sent.body.tools).toEqual([
+        {
+          type: 'function',
+          function: {
+            name: 'get_expense_summary',
+            description: '查表头',
+            parameters: { type: 'object', properties: {}, additionalProperties: false },
+          },
+        },
+      ]);
+      // 显式 auto：查不查由模型定，这个产品决定值得写进请求里而不是靠默认值。
+      expect(sent.body.tool_choice).toBe('auto');
+      // 三条都不能省：assistant 的 tool_calls 不原样回传 → 模型以为调用凭空消失；
+      // tool 结果不带 tool_call_id → 厂商直接 400，而且报错位置离病因很远；
+      // 内部字段（这里没有，但以后可能有）也不能顺着发出去。
+      expect(sent.body.messages).toEqual([
+        { role: 'system', content: 's' },
+        { role: 'user', content: 'q' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'get_expense_summary', arguments: '{}' },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_1', content: '{"code":"BX-1"}' },
+      ]);
+    });
+
+    it('不传 tools 时请求里没有 tools / tool_choice', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: MODEL, choices: [{ message: { content: 'ok' } }] }));
+      });
+
+      await makeProvider(baseUrl).complete(MESSAGES);
+
+      expect(requests[0].body).not.toHaveProperty('tools');
+      expect(requests[0].body).not.toHaveProperty('tool_choice');
     });
   });
 
@@ -270,7 +390,7 @@ describe('OpenAiCompatibleProvider', () => {
       expect(stream.model).toBe(MODEL);
       // ⚠️ 这条挡的是「为了读模型名而提前拉出来的那一帧被丢掉」——
       // 症状是答案少头几个字，而流本身一切正常。
-      expect(await drain(stream.chunks)).toEqual(['你', '好']);
+      expect(await drain(stream.events)).toEqual(['你', '好']);
     });
 
     it('厂商一个 model 字段都没给时退回配置值', async () => {
@@ -294,7 +414,7 @@ describe('OpenAiCompatibleProvider', () => {
       });
 
       const stream = await makeProvider(baseUrl).stream(MESSAGES);
-      expect(await drain(stream.chunks)).toEqual(['好']);
+      expect(await drain(stream.events)).toEqual(['好']);
     });
 
     it('鉴权失败在返回之前就抛 —— 那时上层还没往外写过任何增量', async () => {
@@ -317,7 +437,7 @@ describe('OpenAiCompatibleProvider', () => {
       });
 
       const stream = await makeProvider(baseUrl).stream(MESSAGES);
-      await expect(drain(stream.chunks)).rejects.toThrow(/额度用尽/);
+      await expect(drain(stream.events)).rejects.toThrow(/额度用尽/);
     });
 
     it('响应头到了但首帧不来，算超时', async () => {
@@ -359,7 +479,7 @@ describe('OpenAiCompatibleProvider', () => {
       // 取消**不是**失败。这一条如果变成 rejects，上层就会往一条已经关掉的
       // 连接上写错误事件 —— 用户早就走了，看到的是一堆无意义的报错日志。
       const stream = await pending;
-      expect(await drain(stream.chunks)).toEqual([]);
+      expect(await drain(stream.events)).toEqual([]);
     });
 
     it('流到一半被取消：迭代正常收尾，不抛', async () => {
@@ -376,14 +496,185 @@ describe('OpenAiCompatibleProvider', () => {
       });
 
       const got: string[] = [];
-      for await (const chunk of stream.chunks) {
-        got.push(chunk);
+      for await (const event of stream.events) {
+        if (event.type === 'text') got.push(event.text);
         controller.abort();
       }
 
       expect(got[0]).toBe('一');
       // 「一」之后还有「二」在路上的时候断开，迭代必须**正常结束**：
       // 上层靠「循环走完了 + signal.aborted」来判断是用户走人，而不是出错。
+    });
+
+    it('工具调用碎片按 index 拼成完整调用，且在流末才发出来', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        res.write(frame({ model: MODEL, choices: [{ delta: { role: 'assistant' } }] }));
+        // 第一片带 id 和函数名，参数是空的 —— 实测 DeepSeek 就是这么发的。
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_a',
+                      type: 'function',
+                      function: { name: 'get_expense_summary', arguments: '' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [
+              { delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } },
+            ],
+          }),
+        );
+        res.write(
+          frame({ model: MODEL, choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        );
+        res.end();
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      // ⚠️ 第一条碎片是在 `prime()` 里为了定模型名提前拉出来的。它必须被
+      // 带出那一步 —— 丢了的话症状是「模型说它调了工具，服务端一个都没执行」，
+      // 而流本身看起来完全正常。
+      expect(await drainEvents(stream.events)).toEqual([
+        {
+          type: 'tool_call',
+          call: { id: 'call_a', name: 'get_expense_summary', arguments: '{}' },
+        },
+      ]);
+    });
+
+    it('并行调两个工具时按 index 分开累加，碎片交错也不会串', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_a', function: { name: 'get_expense_summary' } },
+                    { index: 1, id: 'call_b', function: { name: 'list_expense_items' } },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+        // 参数一段段来，而且两个调用交错着来 —— 真厂商就是这样。
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [{ delta: { tool_calls: [{ index: 1, function: { arguments: '{"x"' } }] } }],
+          }),
+        );
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"y":2}' } }] } }],
+          }),
+        );
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [{ delta: { tool_calls: [{ index: 1, function: { arguments: ':1}' } }] } }],
+          }),
+        );
+        res.end();
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      // 结果按 index 排序而不是按到达顺序：调用方的执行顺序应该稳定，
+      // 否则同一份输入两次跑出两种轨迹，轨迹断言就没法写了。
+      expect(await drainEvents(stream.events)).toEqual([
+        {
+          type: 'tool_call',
+          call: { id: 'call_a', name: 'get_expense_summary', arguments: '{"y":2}' },
+        },
+        {
+          type: 'tool_call',
+          call: { id: 'call_b', name: 'list_expense_items', arguments: '{"x":1}' },
+        },
+      ]);
+    });
+
+    it('同一帧里既有文本又有工具碎片时，两样都不丢', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [
+              {
+                delta: {
+                  content: '前缀',
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_a',
+                      function: { name: 'get_expense_summary', arguments: '{}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+        res.end();
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      // 这种帧不常见，但「不常见」不等于「不会发生」。原来那一版对带碎片的帧
+      // 直接 continue，文本会被静默吞掉 —— 症状是答案偶尔少一句，流看起来正常。
+      expect(await drainEvents(stream.events)).toEqual([
+        { type: 'text', text: '前缀' },
+        {
+          type: 'tool_call',
+          call: { id: 'call_a', name: 'get_expense_summary', arguments: '{}' },
+        },
+      ]);
+    });
+
+    it('工具轮没有文本时不会撞上首帧超时', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        // 只有工具碎片，一个文本帧都没有。首帧的判据如果只看文本，
+        // 这里会一直读到流结束才算「开口了」—— 而首帧超时会先到。
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_a', function: { name: 'get_expense_summary' } },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+        setTimeout(() => res.end(), 200);
+      });
+
+      const stream = await makeProvider(baseUrl, { timeoutMs: 60 }).stream(MESSAGES);
+      expect(await drainEvents(stream.events)).toHaveLength(1);
     });
   });
 });

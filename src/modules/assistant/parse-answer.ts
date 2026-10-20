@@ -1,11 +1,11 @@
-import type { AskResult } from './ask.types.js';
+import type { ParsedAnswer } from './ask.types.js';
 
 export type ParseOutcome =
-  | { ok: true; value: AskResult }
+  | { ok: true; value: ParsedAnswer }
   | { ok: false; reason: string };
 
 /**
- * 把模型返回的**原始文本**解析成 AskResult。
+ * 把模型返回的**原始文本**解析成 ParsedAnswer（模型能写的那三个字段）。
  *
  * 纯函数，不碰数据库也不碰网络 —— 这样它才能被穷举地测（见 parse-answer.spec.ts），
  * 而增量解析器也要复用同一份判断标准。

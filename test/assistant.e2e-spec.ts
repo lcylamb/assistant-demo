@@ -48,6 +48,9 @@ describe('AssistantController (e2e)', () => {
     expect(result.conclusion).toContain('招待费超出');
     expect(result.evidence).toContain('rejectReason');
     expect(result.evidence).toContain('status');
+    // 轨迹：驳回原因只能来自审批记录。这里断言的是**具体工具**，不是「查过东西」——
+    // 后者对任何实现都成立，等于没断言。
+    expect(result.trace).toEqual([{ tool: 'get_approval_record', ok: true }]);
   });
 
   it('问草稿单的审批意见，必须答「信息不足」而不是编一个', async () => {
@@ -61,6 +64,8 @@ describe('AssistantController (e2e)', () => {
     // 数据里没有 rejectReason / decidedAt，所以它不该出现在依据里
     expect(result.evidence).not.toContain('rejectReason');
     expect(result.evidence).not.toContain('decidedAt');
+    // 答「信息不足」也必须真的去查过，而不是不查就下结论。
+    expect(result.trace).toEqual([{ tool: 'get_approval_record', ok: true }]);
   });
 
   it('单号不存在 → 404，不是 500', async () => {

@@ -11,7 +11,18 @@
  * 形状像不等于同一套规则 —— 厂商那套必须容忍更多花样，因为它不由我们说了算。
  */
 
-/** 从一帧里解出来的东西。三个字段都可选：大部分帧只有其中一样。 */
+/** 流式帧里的一段工具调用。同一次调用会分很多片到达，靠 `index` 归并。 */
+export interface VendorToolCallDelta {
+  index: number;
+  /** 只有第一片带 id。 */
+  id?: string;
+  /** 只有第一片带 name。 */
+  name?: string;
+  /** 参数 JSON 被切成许多片，逐片拼接才是完整的。 */
+  arguments?: string;
+}
+
+/** 从一帧里解出来的东西。字段都可选：大部分帧只有其中一样。 */
 export interface VendorDelta {
   /** 厂商在这一帧里报的模型名。通常每帧都带，所以我们不必猜。 */
   model?: string;
@@ -19,6 +30,8 @@ export interface VendorDelta {
   text?: string;
   /** 厂商在流中间回的错误（额度用尽、模型下线）。它可能出现在 HTTP 200 的流里。 */
   error?: string;
+  /** 这一帧里工具调用的碎片。 */
+  toolCalls?: VendorToolCallDelta[];
 }
 
 /**
@@ -128,7 +141,86 @@ export function parseVendorDelta(payload: string): VendorDelta {
   if (isRecord(choice) && isRecord(choice.delta)) {
     const content = choice.delta.content;
     if (typeof content === 'string' && content !== '') out.text = content;
+
+    const toolCalls = toolCallDeltas(choice.delta.tool_calls);
+    if (toolCalls.length > 0) out.toolCalls = toolCalls;
   }
+
+  return out;
+}
+
+/**
+ * 非流式响应里的 `choices[0].message`。
+ *
+ * 和 `parseVendorDelta` 分开，是因为两块协议的形状本就不同：流式的工具调用是碎片，
+ * 非流式的是成品。用一个函数兼容两种形状，会把「碎片要拼」这件事藏进分支里。
+ */
+export interface VendorMessage {
+  model?: string;
+  text: string;
+  toolCalls: Array<{ id: string; name: string; arguments: string }>;
+}
+
+export function parseVendorMessage(body: unknown): VendorMessage {
+  const out: VendorMessage = { text: '', toolCalls: [] };
+  if (!isRecord(body)) return out;
+
+  if (typeof body.model === 'string' && body.model !== '') out.model = body.model;
+
+  const choice = Array.isArray(body.choices) ? body.choices[0] : undefined;
+  if (!isRecord(choice)) return out;
+
+  const message = choice.message;
+  if (!isRecord(message)) return out;
+
+  if (typeof message.content === 'string') out.text = message.content;
+
+  if (Array.isArray(message.tool_calls)) {
+    for (const raw of message.tool_calls) {
+      if (!isRecord(raw)) continue;
+      const fn = raw.function;
+      if (!isRecord(fn)) continue;
+      if (typeof fn.name !== 'string' || fn.name === '') continue;
+      out.toolCalls.push({
+        // 有的兼容实现不给 id。补一个确定性的，免得上层拿到空串当主键用。
+        id: typeof raw.id === 'string' && raw.id !== '' ? raw.id : `call_${out.toolCalls.length}`,
+        name: fn.name,
+        arguments: typeof fn.arguments === 'string' ? fn.arguments : '{}',
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * 解一帧里的工具调用碎片。
+ *
+ * `index` 缺失就按 0 处理：协议说必须有，但兼容实现给不给不由我们说了算。
+ * 没有 index 又没有 name/arguments 的碎片直接丢（那是空对象）。
+ */
+function toolCallDeltas(raw: unknown): VendorToolCallDelta[] {
+  if (!Array.isArray(raw)) return [];
+
+  const out: VendorToolCallDelta[] = [];
+  raw.forEach((item, position) => {
+    if (!isRecord(item)) return;
+    const fn = isRecord(item.function) ? item.function : {};
+
+    const index = typeof item.index === 'number' ? item.index : position;
+    const delta: VendorToolCallDelta = { index };
+
+    if (typeof item.id === 'string' && item.id !== '') delta.id = item.id;
+    if (typeof fn.name === 'string' && fn.name !== '') delta.name = fn.name;
+    if (typeof fn.arguments === 'string' && fn.arguments !== '') {
+      delta.arguments = fn.arguments;
+    }
+
+    if (delta.id === undefined && delta.name === undefined && delta.arguments === undefined) {
+      return;
+    }
+    out.push(delta);
+  });
 
   return out;
 }

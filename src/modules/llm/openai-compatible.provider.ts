@@ -5,8 +5,15 @@ import type {
   LlmProvider,
   LlmRequestOptions,
   LlmStream,
+  LlmStreamEvent,
+  LlmToolCall,
 } from './llm.types.js';
-import { parseVendorDelta, sseDataFrames } from './openai-sse.js';
+import {
+  parseVendorDelta,
+  parseVendorMessage,
+  sseDataFrames,
+  type VendorToolCallDelta,
+} from './openai-sse.js';
 
 /**
  * 真模型。走 OpenAI 的 `/chat/completions` 协议。
@@ -91,14 +98,21 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     const response = await this.post(messages, options, false);
 
     const body = (await response.json().catch(() => null)) as unknown;
-    const text = pick(body, 'choices', 0, 'message', 'content');
-    if (typeof text !== 'string' || text === '') {
+    const message = parseVendorMessage(body);
+
+    // 只有工具调用、没有文本是**正常**的一轮 —— 模型决定先查数据再回答。
+    // 所以「两个都空」才算异常。
+    if (message.text === '' && message.toolCalls.length === 0) {
       throw new Error(
-        `厂商响应里没有 choices[0].message.content：${truncate(stringify(body))}`,
+        `厂商响应里既没有 choices[0].message.content 也没有 tool_calls：${truncate(stringify(body))}`,
       );
     }
 
-    return { text, model: pickString(body, 'model') ?? this.config.model };
+    return {
+      text: message.text,
+      model: message.model ?? this.config.model,
+      toolCalls: message.toolCalls,
+    };
   }
 
   /**
@@ -152,15 +166,21 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     const timing = { timedOut: false };
     const callerAborted = () => controller.signal.aborted && !timing.timedOut;
 
+    // 工具调用的碎片流会在两个阶段被读到：`prime()` 为了确定模型名会先拉几帧，
+    // 剩下的在消费端继续读。所以累加器必须**跨这两个阶段**存在，
+    // 否则第一批碎片会被丢掉 —— 症状是「模型说它调了工具，服务端却一个都没执行」。
+    const toolCalls = new ToolCallAccumulator();
+
     try {
-      const primed = await this.prime(messages, options, controller, timing);
+      const primed = await this.prime(messages, options, controller, timing, toolCalls);
       // 到这里模型名一定有了：要么从帧里捡到，要么退回配置值。
       // ⚠️ 退回来说明厂商一个 model 字段都没给，那这条流的来源就只能靠配置解释了。
       return {
         model: primed.model,
-        chunks: this.textChunks(
+        events: this.streamEvents(
           primed.iterator,
           primed.first,
+          toolCalls,
           detach,
           callerAborted,
         ),
@@ -171,7 +191,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       // 干净地结束，不往一条已经关掉的连接上写错误事件。
       if (callerAborted()) {
         this.logger.log('调用方已取消，模型请求提前结束');
-        return { model: this.config.model, chunks: emptyChunks() };
+        return { model: this.config.model, events: emptyEvents() };
       }
       if (timing.timedOut) {
         throw new Error(`等待模型第一个字超时（${this.config.timeoutMs} ms）`);
@@ -200,6 +220,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     options: LlmRequestOptions | undefined,
     controller: AbortController,
     timing: { timedOut: boolean },
+    toolCalls: ToolCallAccumulator,
   ): Promise<{ iterator: AsyncIterator<string>; model: string; first: string[] }> {
     const deadline = setTimeout(() => {
       timing.timedOut = true;
@@ -223,10 +244,17 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         const delta = parseVendorDelta(value);
         if (delta.error) throw new Error(`厂商在流里回了错误：${delta.error}`);
         if (delta.model) model = delta.model;
+        if (delta.toolCalls) toolCalls.add(delta.toolCalls);
+
         if (delta.text) {
           first.push(delta.text);
           break;
         }
+
+        // 「第一帧有内容」的判据不能只看文本：模型决定调工具时，这一轮根本不会有文本。
+        // 只等 text 的话，要一直读到流结束才返回 —— 首帧超时会把一次正常的工具调用
+        // 误判成厂商挂了。所以工具碎片也算「它开口了」。
+        if (delta.toolCalls) break;
       }
 
       return { iterator, model, first };
@@ -239,20 +267,24 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   }
 
   /**
-   * 把剩下的帧变成纯文本块。
+   * 把剩下的帧变成事件。
    *
    * `first` 是首帧里已经取出来的那段 —— 它是在 `stream()` 里为了定 model 而提前拉出来的，
    * 不能丢，所以在这里补在最前面。少了这一步的症状是「答案少了开头几个字」，
    * 而流本身一切正常，很难往这儿想。
+   *
+   * 工具调用**攒到最后一次性发**：厂商发的是碎片，上层拿到完整的调用才能执行。
+   * 这不是为了省事 —— 半截的 `{"co` 根本无法解析，也没有执行价值。
    */
-  private async *textChunks(
+  private async *streamEvents(
     iterator: AsyncIterator<string>,
     first: string[],
+    toolCalls: ToolCallAccumulator,
     detach: () => void,
     callerAborted: () => boolean,
-  ): AsyncGenerator<string> {
+  ): AsyncGenerator<LlmStreamEvent> {
     try {
-      for (const text of first) yield text;
+      for (const text of first) yield { type: 'text', text };
 
       for (;;) {
         const { value, done } = await iterator.next();
@@ -260,8 +292,14 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 
         const delta = parseVendorDelta(value);
         if (delta.error) throw new Error(`厂商在流里回了错误：${delta.error}`);
-        if (delta.text) yield delta.text;
+        // 先收工具碎片，再把文本发出去 —— 两者撞在同一帧里时**都不能丢**。
+        // 早先这里对带碎片的那一帧直接 `continue`，文本会被静默吞掉：
+        // 症状是答案偶尔少一句话，而流本身一切正常。
+        if (delta.toolCalls) toolCalls.add(delta.toolCalls);
+        if (delta.text) yield { type: 'text', text: delta.text };
       }
+
+      for (const call of toolCalls.finish()) yield { type: 'tool_call', call };
     } catch (error) {
       // 断开**发生在流中间**时走的是这条路（底层 body 被 abort，read 直接抛）。
       // 上层 `streamAnswer` 是靠「循环正常走完 + signal.aborted」判断用户走人的，
@@ -293,8 +331,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   ): Promise<Response> {
     const body: Record<string, unknown> = {
       model: this.config.model,
-      // 只传 role/content，别把项目内部的字段顺出去。
-      messages: messages.map(({ role, content }) => ({ role, content })),
+      // 只传协议认识的字段，别把项目内部的字段顺出去。
+      messages: messages.map(serializeMessage),
       // 温度 0 是「尽量稳定」，不是「确定」。
       //
       // ⚠️ 这条注释原来写的是「同一份数据问同一个问题，答案稳定，评测的断言建立在这上面」。
@@ -309,6 +347,22 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       stream,
     };
     if (this.config.jsonMode) body.response_format = { type: 'json_object' };
+
+    // 工具定义是**请求的一部分**，不是业务代码里的 if。模型看到的只有这三样：
+    // 名字、描述、参数 schema —— 它按这个自己决定调不调、调哪个。
+    if (options?.tools && options.tools.length > 0) {
+      body.tools = options.tools.map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+        },
+      }));
+      // 显式写 auto 而不是靠默认值：这个值说明的是**产品决定**
+      // （查不查由模型定，不由我们预判），值得写出来。
+      body.tool_choice = 'auto';
+    }
 
     let response: Response;
     try {
@@ -374,28 +428,85 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   }
 }
 
-async function* emptyChunks(): AsyncGenerator<string> {
+async function* emptyEvents(): AsyncGenerator<LlmStreamEvent> {
   // 什么都不吐。调用方（`AssistantService.streamAnswer`）会看到流立刻就结束了。
 }
 
-/** 顺着一条路径取值，中途类型不对就当没找到 —— 厂商的响应结构不由我们保证。 */
-function pick(value: unknown, ...path: Array<string | number>): unknown {
-  let current: unknown = value;
-  for (const key of path) {
-    if (typeof key === 'number') {
-      if (!Array.isArray(current)) return undefined;
-      current = current[key];
-    } else {
-      if (typeof current !== 'object' || current === null) return undefined;
-      current = (current as Record<string, unknown>)[key];
-    }
+/**
+ * 把内部消息翻译成厂商的线格式。
+ *
+ * 三处不能省：
+ *   · assistant 带工具调用那轮，必须把 `tool_calls` **原样回传** —— 厂商要靠它
+ *     把下一轮的 `role:"tool"` 结果对上号，缺了这一段，模型会以为工具调用凭空消失了。
+ *   · `role:"tool"` 必须带 `tool_call_id`，它是**唯一**的配对依据（不是函数名）。
+ *   · 不带工具调用的普通消息只留 role/content，项目内部的字段一个都不外送。
+ */
+function serializeMessage(message: LlmMessage): Record<string, unknown> {
+  if (message.role === 'tool') {
+    return {
+      role: 'tool',
+      tool_call_id: message.toolCallId ?? '',
+      content: message.content,
+    };
   }
-  return current;
+
+  if (message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0) {
+    return {
+      role: 'assistant',
+      content: message.content,
+      tool_calls: message.toolCalls.map((call) => ({
+        id: call.id,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      })),
+    };
+  }
+
+  return { role: message.role, content: message.content };
 }
 
-function pickString(value: unknown, ...path: Array<string | number>): string | undefined {
-  const found = pick(value, ...path);
-  return typeof found === 'string' && found !== '' ? found : undefined;
+/**
+ * 把流里按 `index` 到达的工具调用碎片拼成完整的调用。
+ *
+ * 碎片长这样（实测 DeepSeek）：
+ *   帧1  index:0, id:"call_x", name:"get_expense_summary", arguments:""
+ *   帧2  index:0,                                          arguments:"{}"
+ * 参数被切成任意多段是常态，所以必须**按 index 累加**，不能遇到一片就发一次。
+ */
+class ToolCallAccumulator {
+  private readonly calls = new Map<
+    number,
+    { id: string; name: string; arguments: string }
+  >();
+
+  add(deltas: VendorToolCallDelta[]): void {
+    for (const delta of deltas) {
+      const current = this.calls.get(delta.index) ?? {
+        id: '',
+        name: '',
+        arguments: '',
+      };
+
+      if (delta.id) current.id = delta.id;
+      if (delta.name) current.name = delta.name;
+      if (delta.arguments) current.arguments += delta.arguments;
+
+      this.calls.set(delta.index, current);
+    }
+  }
+
+  finish(): LlmToolCall[] {
+    return [...this.calls.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, call], index) => ({
+        // 兼容实现可能不给 id —— 补一个稳定的，不然下一轮回传时配不上对。
+        id: call.id || `call_${index}`,
+        name: call.name,
+        // 参数可能一片都没来（无参工具）。空串不是合法 JSON，按 `{}` 处理。
+        arguments: call.arguments || '{}',
+      }))
+      .filter((call) => call.name !== '');
+  }
 }
 
 function stringify(value: unknown): string {

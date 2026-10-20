@@ -492,6 +492,18 @@ const STATUS_TEXT = {
   error: '出错',
 };
 
+/**
+ * 工具名 → 页面上显示的中文短标签。
+ *
+ * 长名字（get_expense_summary）挤在那一行里会把「首字延迟 / 总耗时」顶掉，
+ * 而这里要说的只有一件事：它查的是哪一块。评测报告用的是同一套标签。
+ */
+const TOOL_LABEL = {
+  get_expense_summary: '表头',
+  list_expense_items: '明细',
+  get_approval_record: '审批',
+};
+
 let currentCode = 'BX-2026-0003';
 let controller = null;
 
@@ -781,6 +793,19 @@ function finish(bot, result, startedAt, firstDeltaAt, deltaChars) {
     `首字延迟 <b>${elapsed(firstDeltaAt)}</b>` +
     `　·　总耗时 <b>${Math.round(performance.now() - startedAt)} ms</b>` +
     `　·　增量 <b>${deltaChars}</b> 字　·　最终 <b>${result.conclusion.length}</b> 字`;
+
+  // trace 是「这个回答是怎么来的」的唯一可见证据：模型自己决定查了什么。
+  // 用 textContent 而不是拼进上面的 innerHTML —— 工具名来自服务端，
+  // 页面不该把任何服务端字符串当成 HTML 解析。
+  const tools = (result.trace ?? []).map((step) => {
+    const label = TOOL_LABEL[step.tool] ?? step.tool;
+    return step.ok ? label : `${label}（失败）`;
+  });
+  if (tools.length > 0) {
+    const line = document.createElement('span');
+    line.textContent = `　·　查了 ${tools.join(' → ')}`;
+    bot.metrics.appendChild(line);
+  }
 }
 
 /** 中途失败：网络断了、格式校验没过、或者服务端 yield 了一个 error 事件。 */

@@ -1,19 +1,37 @@
 /**
- * `/assistant/ask` 的返回结构。
+ * 模型**自己**给出的那部分。
  *
- * 三个字段缺一不可，而且**都是给用户看的**：
- *   · conclusion   —— 结论，一句话
- *   · evidence     —— 依据来自哪几个字段。用户能顺着它去核对，所以这是「可验证性」的载体
- *   · insufficient —— 数据不够时必须显式为 true，而不是让模型编一个听起来合理的答案
- *
- * 这个结构一旦定下来就不该轻易改：流式端点、评测断言都建立在它上面。
+ * 和 `AskResult` 分开是因为它只有三个字段是模型能写的：
+ * trace 由服务端根据「实际执行了哪些工具」生成，绝不能让模型自述 ——
+ * 「我查了审批记录」这句话如果是模型写的，恰好就是最该被校验的那种事实。
  */
-export interface AskResult {
+export interface ParsedAnswer {
   conclusion: string;
-  /** 用到的字段路径，取值必须来自 ExpenseContext.availableFields */
+  /** 用到的字段路径，取值必须来自**本次实际调用过的工具**返回的字段 */
   evidence: string[];
   /** 数据是否不足以回答 */
   insufficient: boolean;
+}
+
+/** 一次工具调用。只记名字和成败 —— 参数和结果不进响应，那是日志的事。 */
+export interface AgentStep {
+  tool: string;
+  ok: boolean;
+}
+
+/**
+ * `/assistant/ask` 的返回结构。
+ *
+ *   · conclusion   —— 结论，一句话
+ *   · evidence     —— 依据来自哪几个字段。用户能顺着它去核对，所以这是「可验证性」的载体
+ *   · insufficient —— 数据不够时必须显式为 true，而不是让模型编一个听起来合理的答案
+ *   · trace        —— 这次答出来之前，模型**自己决定**调了哪些工具
+ *
+ * trace 是给「这个回答是怎么来的」一个可检查的答案。它同时是评测轨迹断言的输入：
+ * 没有它，轨迹只能靠刮日志，而日志格式本来就是会变的。
+ */
+export interface AskResult extends ParsedAnswer {
+  trace: AgentStep[];
 }
 
 /**

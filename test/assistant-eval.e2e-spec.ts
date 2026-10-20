@@ -45,6 +45,12 @@ import { asResult, parseSse } from './support/sse.js';
  *    反过来，已知不足哪天不红了，用例会失败并要求把这个标记删掉，
  *    否则它会慢慢变成一张永久的免罪符。
  *
+ * 4. **除了答得对不对，还要看数据是怎么来的。** 后接上工具调用之后，同一个正确答案
+ *    可以来自不同的查询路径。有的路径是巧合（没查审批却答对了驳回原因），
+ *    有的路径是错的（拿整单提交日回答「费用发生日」）。所以每条用例还断言
+ *    **必须查过哪个工具** —— 这是「轨迹评测」，也是这一层和只看最终答案的评测
+ *    最本质的区别。工具执行失败则单列为结构问题，knownGap 不豁免。
+ *
  * ── 每条用例都跑两条端点 ──
  *
  * `/assistant/ask` 和 `/assistant/askStream` 各打一次，**两条都各自过一遍结构底线和语义断言**。
@@ -56,8 +62,9 @@ import { asResult, parseSse } from './support/sse.js';
  *     两次逐字相同、一次换了说法；E01 的结论一字不差，evidence 却一次一个字段、
  *     一次两个。拿两次独立采样做全等，红的是骰子，不是代码。
  *
- * 跨任何 provider 都成立的结构断言只有一条流内部的：**增量吐出的字必须等于
- * 这次流自己的 `done.conclusion`**。它不涉及第二次调用，锁的是增量解析器本身。
+ * 跨任何 provider 都成立的结构断言有两条：一条在流内部 —— **增量吐出的字必须等于
+ * 这次流自己的 `done.conclusion`**，它不涉及第二次调用，锁的是增量解析器本身；
+ * 另一条在轨迹里 —— **工具不能执行失败**。它也不涉及两次调用，锁的是工具和数据。
  * 早先这里写成了「增量 vs 非流式那次调用的结论」，在 mock 上碰巧一直成立，
  * 接真模型当天就红了 —— 而管道其实是好的。
  *
@@ -140,6 +147,18 @@ interface EvalCase {
   /** 这条在测什么 —— 会打进表里 */
   focus: string;
   expect: (row: RowData) => CaseExpectation;
+  /**
+   * 这个问题**必须查过**哪个工具。
+   *
+   * 它测的不是「答得对不对」，而是「数据是怎么来的」—— 同一个正确答案可以用不同
+   * 路径拿到，但有些路径是巧合：模型答对了驳回原因，却从没查过审批记录，
+   * 那只说明它蒙对了措辞。轨迹断言就是把这种蒙对挡在外面。
+   *
+   * 它是**语义**问题而不是结构问题，所以 knownGap 能豁免它：
+   * E08 那种「用了错的工具、于是答了另一件事」的坑，正是已知不足的形状。
+   * 而「工具执行失败」是结构问题，永远不豁免 —— 见 trajectoryStructuralProblems。
+   */
+  expectTools?: string[];
   /** 通用期望表达不了的检查，返回发现的问题（空数组 = 没问题） */
   check?: (result: AskResult, row: RowData) => string[];
   /**
@@ -159,6 +178,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0003',
     question: '这张单子为什么被驳回了？',
     focus: '能答：驳回原因',
+    expectTools: ['get_approval_record'],
     expect: () => ({
       insufficient: false,
       mustMention: ['招待费超出'],
@@ -170,6 +190,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0009',
     question: '这张单子为什么被驳回了？',
     focus: '能答：第二条驳回单',
+    expectTools: ['get_approval_record'],
     expect: () => ({
       insufficient: false,
       mustMention: ['发票抬头'],
@@ -181,6 +202,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0005',
     question: '审批意见是什么？',
     focus: '信息不足：草稿单没有审批',
+    expectTools: ['get_approval_record'],
     expect: () => ({
       insufficient: true,
       // 数据里没有这两样，它们也就不该出现在依据里
@@ -192,6 +214,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0004',
     question: '审批意见是什么？',
     focus: '信息不足：待审批也没意见',
+    expectTools: ['get_approval_record'],
     // 和 E03 的区别在于状态不同（SUBMITTED 而非 DRAFT）。
     // 两条一起才说明「信息不足」是按数据判的，不是按「看起来没走完」判的。
     expect: () => ({
@@ -204,6 +227,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0010',
     question: '什么时候提交的？',
     focus: '能答：草稿≠全无信息',
+    expectTools: ['get_expense_summary'],
     // 这条挡的是「一看到草稿就整张判成信息不足」的偷懒做法：
     // 审批信息没有，提交时间是有的，该答就得答。
     //
@@ -221,6 +245,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0002',
     question: '这笔钱都花在哪些项目上？',
     focus: '能答：多明细逐条列出',
+    expectTools: ['list_expense_items'],
     expect: (row) => ({
       insufficient: false,
       // 每条明细都点到名 —— 明细名从库里取，不手写。
@@ -239,6 +264,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0001',
     question: '金额是多少？',
     focus: '金额溯源：¥3150.00',
+    expectTools: ['get_expense_summary'],
     // 期望的金额从库里算，不手写 —— 手写的金额会在改 seed 后悄悄过期。
     expect: (row) => ({
       insufficient: false,
@@ -251,10 +277,14 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0006',
     question: '费用发生的日期是哪天？',
     focus: '陷阱：费用发生日 vs 提交日',
+    // 正确答案在明细的 spentOn 上。没查明细就答日期，只能答成提交日 ——
+    // 这正是这条用例要抓的坑，所以轨迹断言放在这里比语义断言更早命中。
+    expectTools: ['list_expense_items'],
     knownGap: {
       provider: 'mock',
       reason:
-        'mock 的「时间」规则命中的是 submittedAt，把整单提交日当成了费用发生日。' +
+        'mock 的「时间」规则命中的是 submittedAt，把整单提交日当成了费用发生日；' +
+        '轨迹断言也把它点出来了 —— 它选的是表头工具，根本没查明细。' +
         '真实模型也很容易踩这个坑（问题是「费用发生」，答案的关键在明细的 spentOn 上）',
     },
     expect: () => ({ insufficient: false }),
@@ -270,6 +300,7 @@ const CASES: EvalCase[] = [
     code: 'BX-2026-0008',
     question: '这笔钱都花在哪些项目上？',
     focus: '能答：单条与多条明细',
+    expectTools: ['list_expense_items'],
     expect: () => ({
       insufficient: false,
       mustMention: ['易拉宝'],
@@ -385,6 +416,45 @@ function evidenceCovers(evidence: string[], field: string): boolean {
       item.startsWith(`${field}.`) ||
       item.startsWith(`${field}[`),
   );
+}
+
+/**
+ * 轨迹的**结构**问题：工具到底有没有执行成功。
+ *
+ * 这一条永远算失败，knownGap 不豁免 —— 模型答得好不好是一回事，
+ * 工具根本跑挂了是另一回事。早先所有断言都只看最终答案，于是
+ * 「工具失败了、模型照着失败信息硬答」会显示成一条正常的误解，
+ * 而真正该修的是工具。
+ */
+function trajectoryStructuralProblems(result: AskResult): string[] {
+  if (!Array.isArray(result.trace)) return ['响应里没有 trace'];
+
+  return result.trace
+    .filter((step) => !step.ok)
+    .map((step) => `工具 ${step.tool} 执行失败`);
+}
+
+/**
+ * 轨迹的**语义**问题：该查的查了没有。
+ *
+ * 只认 `ok:true` 的步骤：一个失败的工具调用不提供任何数据，
+ * 把它算成「查过了」等于让防线在最该严的地方松掉。
+ */
+function trajectorySemanticProblems(c: EvalCase, result: AskResult): string[] {
+  const expected = c.expectTools;
+  if (!expected || expected.length === 0) return [];
+
+  const called = (result.trace ?? [])
+    .filter((step) => step.ok)
+    .map((step) => step.tool);
+  const missing = expected.filter((tool) => !called.includes(tool));
+  if (missing.length === 0) return [];
+
+  return [
+    `应该查 ${missing.join('、')}，实际查的是 ${
+      called.length > 0 ? [...new Set(called)].join('、') : '（一个都没查）'
+    }`,
+  ];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -505,6 +575,8 @@ interface CaseResult {
   knownGap?: string;
   /** 增量吐出的字数 / 最终结论字数 */
   chars: [number, number];
+  /** 这次实际调用过的工具名（按调用顺序，可能重复） */
+  tools: string[];
   hallucinated: boolean;
 }
 
@@ -624,8 +696,14 @@ describe('评测集 (e2e)', () => {
     // 分开这件事是变异测试逼出来的：把 `dropUnknownEvidence` 拆掉之后，
     // 两条 knownGap 用例照样显示「已知不足」，而它们其实已经在编字段了 ——
     // 一个标记把管道故障一起盖住了。
-    const structural = structuralProblems(awaited, row!.context);
-    const problems = semanticProblems(c, awaited, row!);
+    const structural = [
+      ...structuralProblems(awaited, row!.context),
+      ...trajectoryStructuralProblems(awaited),
+    ];
+    const problems = [
+      ...semanticProblems(c, awaited, row!),
+      ...trajectorySemanticProblems(c, awaited),
+    ];
 
     if (!done || !viaStream) {
       structural.push(
@@ -636,9 +714,13 @@ describe('评测集 (e2e)', () => {
       // 只拿它和非流式比全等的话，在真模型上什么也比不出来（见文件头）。
       structural.push(
         ...structuralProblems(viaStream, row!.context).map((p) => `流式端点：${p}`),
+        ...trajectoryStructuralProblems(viaStream).map((p) => `流式端点：${p}`),
       );
       for (const problem of semanticProblems(c, viaStream, row!)) {
         // 同一个问题两条端点上都有时只说一次；只有流式那条坏掉时标出来。
+        if (!problems.includes(problem)) problems.push(`流式端点：${problem}`);
+      }
+      for (const problem of trajectorySemanticProblems(c, viaStream)) {
         if (!problems.includes(problem)) problems.push(`流式端点：${problem}`);
       }
 
@@ -682,6 +764,7 @@ describe('评测集 (e2e)', () => {
       structural,
       knownGap: gap?.reason,
       chars: [joined.length, viaStream?.conclusion.length ?? 0],
+      tools: awaited.trace.map((step) => step.tool),
       hallucinated,
     });
 
@@ -768,6 +851,25 @@ const VERDICT_LABEL = {
   fail: '✗ 不符预期',
 } as const;
 
+/**
+ * 报告里工具名印成中文短标签。
+ *
+ * 工具名有 19 个字符，直接印会把表撑得很宽；而这个列要回答的问题只有
+ * 「它查的是哪一块」，短标签足够。失败详情里仍然印完整工具名 ——
+ * 那时需要的是能拿去 grep 的字符串。
+ */
+const TOOL_LABEL: Record<string, string> = {
+  get_expense_summary: '表头',
+  list_expense_items: '明细',
+  get_approval_record: '审批',
+};
+
+function toolLabels(tools: string[]): string {
+  return tools.length === 0
+    ? '（未调）'
+    : tools.map((tool) => TOOL_LABEL[tool] ?? tool).join('→');
+}
+
 function printReport(
   results: CaseResult[],
   warnMessages: string[],
@@ -778,6 +880,7 @@ function printReport(
     { title: '用例', width: 6 },
     { title: '单号', width: 14 },
     { title: '测什么', width: 26 },
+    { title: '工具', width: 12 },
     { title: '增量/最终', width: 12 },
     { title: '判定', width: 12 },
   ];
@@ -788,6 +891,7 @@ function printReport(
   console.log(
     `\n评测结果（${results.length} 条用例，每条都跑了两条端点）　provider：${providerName}`,
   );
+  console.log('工具列：表头=get_expense_summary　明细=list_expense_items　审批=get_approval_record');
   // 跑的是规则表就得说出来。同一张全绿的表，一个是「模型答得准」，
   // 另一个只是「规则表按预期执行了」—— 两者的含义差着一个量级。
   if (!deterministic) {
@@ -808,8 +912,9 @@ function printReport(
         pad(r.id, columns[0].width),
         pad(r.code, columns[1].width),
         pad(r.focus, columns[2].width),
-        pad(`${r.chars[0]} / ${r.chars[1]}`, columns[3].width),
-        pad(VERDICT_LABEL[r.verdict], columns[4].width),
+        pad(toolLabels(r.tools), columns[3].width),
+        pad(`${r.chars[0]} / ${r.chars[1]}`, columns[4].width),
+        pad(VERDICT_LABEL[r.verdict], columns[5].width),
       ].join(' │ '),
     );
   }
