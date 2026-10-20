@@ -6,6 +6,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  RequestTimeoutException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service.js';
@@ -99,6 +100,51 @@ const DB_UNAVAILABLE_MESSAGE = '数据库暂时不可用，请稍后重试';
 const MAX_TOOL_STEPS = 4;
 
 /**
+ * 整个请求的预算：从开始跑 Agent 循环到收口，最多多久。
+ *
+ * ── 每一轮都有超时，为什么还要一个总预算 ──
+ *
+ * 因为那是「每一轮」的上限，不是「这次提问」的。4 轮 × 30 秒 = 两分钟，
+ * 再加上准备阶段和工具执行 —— 单看每个数字都不离谱，合起来却是用户盯着
+ * 「生成中」转两分钟。真实回答通常 1~3 秒；90 秒是**绝不允许超过**的天花板，
+ * 不是预期值。
+ *
+ * 到了预算之后能做的只有「别再开始了」：已经发出去的字收不回来，
+ * 所以流式是一条 error 帧（前端会渲染），非流式是 504。
+ *
+ * 0 = 关掉。
+ */
+const DEFAULT_ASK_TIMEOUT_MS = 90_000;
+
+/** 两条端点说同一句话 —— 用户不该因为换了接口就以为遇到了两个问题。 */
+const ASK_TIMEOUT_MESSAGE = '这次回答超时了，请稍后再试';
+
+interface AskBudget {
+  /** 传给模型调用的取消信号：到点时把它掐掉。 */
+  signal: AbortSignal | undefined;
+  /** 到点了吗。比 `signal.aborted` 可靠 —— 后者也可能是用户自己取消的。 */
+  expired(): boolean;
+  dispose(): void;
+}
+
+/**
+ * 读 `ASK_TIMEOUT_MS`。
+ *
+ * 非法值回落到默认值而不是当场失败：这是**保护性**配置，配错了应该退回
+ * 「有一次保守的兜底」，而不是让整个服务起不来。和 `LLM_TIMEOUT_MS` 相反 ——
+ * 那个配错会让答案质量悄悄变化（比如 30 秒变成 15 秒），值得炸；
+ * 这个配错只是让兜底时长变了。
+ */
+function askTimeoutMs(): number {
+  const raw = process.env.ASK_TIMEOUT_MS?.trim();
+  if (!raw) return DEFAULT_ASK_TIMEOUT_MS;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_ASK_TIMEOUT_MS;
+  return value;
+}
+
+/**
  * 一次提问的会话状态。
  *
  * 为什么不是把数据放进 prompt：`expenseId` 是**服务端绑定**的，模型碰不到。
@@ -145,9 +191,10 @@ export class AssistantService {
    */
   async ask(dto: AskDto): Promise<AskResult> {
     const session = await this.prepare(dto);
+    const budget = this.budget();
 
     try {
-      const result = await this.runAgent(session);
+      const result = await this.runAgent(session, budget);
       this.record(session, 'ok', null, result.trace.length);
       return result;
     } catch (error) {
@@ -155,22 +202,81 @@ export class AssistantService {
       // 慢到超时的那些恰恰被排除在外。
       this.record(session, 'error', null, 0);
       throw error;
+    } finally {
+      budget.dispose();
     }
   }
 
+  /**
+   * 造一个请求预算：到点就掐掉正在跑的那次模型调用。
+   *
+   * 用户自己的取消和预算到点都会让 signal 变成 aborted，但两者的处理完全不同 ——
+   * 前者安静收场，后者要告诉用户「超时了」。所以这里把「是我掐的」单独记着，
+   * 而不是事后从 signal 上猜。
+   */
+  private budget(callerSignal?: AbortSignal): AskBudget {
+    const limit = askTimeoutMs();
+    if (limit === 0) {
+      return {
+        signal: callerSignal,
+        expired: () => false,
+        dispose: () => {},
+      };
+    }
+
+    const controller = new AbortController();
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      controller.abort();
+    }, limit);
+
+    return {
+      signal: callerSignal
+        ? AbortSignal.any([callerSignal, controller.signal])
+        : controller.signal,
+      expired: () => expired,
+      dispose: () => clearTimeout(timer),
+    };
+  }
+
+  /** 到预算的统一收尾：日志留下「跑到第几轮才放弃」，那是判断该调大还是该查慢的依据。 */
+  private timeoutError(session: AgentSession): RequestTimeoutException {
+    this.logTimeout(session);
+    return new RequestTimeoutException(ASK_TIMEOUT_MESSAGE);
+  }
+
+  private logTimeout(session: AgentSession): void {
+    this.logger.warn(
+      `请求超过预算 ${askTimeoutMs()} ms，放弃（${session.code}，` +
+        `已跑 ${session.modelCalls} 轮模型调用，工具 ${session.toolMs} ms）`,
+    );
+  }
+
   /** 非流式的 Agent 循环。抽出来是为了让 `ask()` 能用 try/catch 统一打点。 */
-  private async runAgent(session: AgentSession): Promise<AskResult> {
+  private async runAgent(
+    session: AgentSession,
+    budget: AskBudget,
+  ): Promise<AskResult> {
     const trace: AgentStep[] = [];
 
     for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
+      // 上一轮的工具可能刚好把预算用完。在**开始下一轮之前**判，
+      // 而不是等模型跑完才发现 —— 那一轮的开销就白花了。
+      if (budget.expired()) throw this.timeoutError(session);
+
       this.assertQuota();
 
       let completion;
       try {
         completion = await this.llm.complete(session.messages, {
           tools: TOOL_SPECS,
+          signal: budget.signal,
         });
       } catch (error) {
+        // 到点被掐掉和厂商自己失败必须分开：前者是我们主动停的，
+        // 报成 502 会让排查的人去查厂商，而真正的原因是这次请求太慢。
+        if (budget.expired()) throw this.timeoutError(session);
         this.logModelFailure(error);
         throw new BadGatewayException('模型调用失败，请重试');
       }
@@ -209,8 +315,11 @@ export class AssistantService {
    */
   async *streamAnswer(
     session: AgentSession,
-    signal?: AbortSignal,
+    callerSignal?: AbortSignal,
   ): AsyncGenerator<AssistantStreamEvent> {
+    // 预算和调用方的取消是两条独立的线：用户关页面要**静默**收场，
+    // 预算到点要**告诉用户**。合在一个 signal 里传下去，但分开判。
+    const budget = this.budget(callerSignal);
     const trace: AgentStep[] = [];
     let emitted = '';
     let ttftMs: number | null = null;
@@ -233,10 +342,17 @@ export class AssistantService {
         try {
           stream = await this.llm.stream(session.messages, {
             tools: TOOL_SPECS,
-            signal,
+            signal: budget.signal,
           });
         } catch (error) {
-          if (signal?.aborted) {
+          // 预算到点在前：两者都会让 signal.aborted 为真，但话不一样。
+          if (budget.expired()) {
+            this.logTimeout(session);
+            outcome = 'error';
+            yield { type: 'error', message: ASK_TIMEOUT_MESSAGE };
+            return;
+          }
+          if (callerSignal?.aborted) {
             this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
             return;
           }
@@ -289,7 +405,13 @@ export class AssistantService {
             }
           }
         } catch (error) {
-          if (signal?.aborted) {
+          if (budget.expired()) {
+            this.logTimeout(session);
+            outcome = 'error';
+            yield { type: 'error', message: ASK_TIMEOUT_MESSAGE };
+            return;
+          }
+          if (callerSignal?.aborted) {
             this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
             return;
           }
@@ -299,7 +421,17 @@ export class AssistantService {
           return;
         }
 
-        if (signal?.aborted) {
+        // ⚠️ 这一处不能省。预算到点时，provider 看到的是「调用方取消」，
+        // 它按约定**干净地结束**、返回一条空流 —— 循环不会抛，只会静悄悄地走完。
+        // 不在这里判的话，空文本会被当成一次「模型没说话」，最后报成格式异常。
+        if (budget.expired()) {
+          this.logTimeout(session);
+          outcome = 'error';
+          yield { type: 'error', message: ASK_TIMEOUT_MESSAGE };
+          return;
+        }
+
+        if (callerSignal?.aborted) {
           this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
           return;
         }
@@ -360,6 +492,9 @@ export class AssistantService {
       // 未预期的异常照样要打点，然后原样抛给 controller 的 finally 去收尾。
       throw error;
     } finally {
+      // 不释放的话，一个还在待触发的定时器会让进程多活最多 90 秒 ——
+      // 测试进程尤其明显：用例跑完了，vitest 还在等它。
+      budget.dispose();
       this.record(session, outcome, ttftMs, trace.length);
     }
   }

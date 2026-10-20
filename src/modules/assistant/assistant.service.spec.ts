@@ -1,6 +1,7 @@
 import {
   BadGatewayException,
   Logger,
+  RequestTimeoutException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { Prisma } from '../../generated/prisma/client.js';
@@ -685,5 +686,95 @@ describe('AssistantService.streamAnswer（带工具的流）', () => {
       type: 'done',
       data: { conclusion: '不需要查。', insufficient: true, trace: [] },
     });
+  });
+});
+
+describe('AssistantService（请求预算）', () => {
+  // 每个用例自己设一个小值，跑完恢复 —— 漏了的话后面所有用例都会带着它。
+  const saved = process.env.ASK_TIMEOUT_MS;
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env.ASK_TIMEOUT_MS;
+    else process.env.ASK_TIMEOUT_MS = saved;
+  });
+
+  /** 一个永远不回、但会像真 provider 那样响应取消的模型。 */
+  function hangingLlm(): LlmProvider {
+    return {
+      name: 'hanging',
+      complete: (_messages, options) =>
+        new Promise<LlmCompletion>((_resolve, reject) => {
+          options?.signal?.addEventListener('abort', () =>
+            reject(new Error('模型调用被取消')),
+          );
+        }),
+      stream: async (_messages, options) =>
+        // 真 provider 被取消时是**干净地返回一条空流**，不是抛 —— 这里必须一样，
+        // 否则测到的是一条服务层永远不会遇到的路径。
+        new Promise<LlmStream>((resolve) => {
+          options?.signal?.addEventListener('abort', () =>
+            resolve({
+              model: 'hanging',
+              events: (async function* () {})(),
+            }),
+          );
+        }),
+    };
+  }
+
+  it('非流式：模型一直不回，到点给 504，而不是让请求挂住', async () => {
+    process.env.ASK_TIMEOUT_MS = '30';
+    const service = makeService(makePrisma(), hangingLlm());
+
+    const error = await service.ask(DTO).catch((caught: unknown) => caught);
+
+    // 504 而不是 502：错在「这次太慢」，不是「厂商坏了」。
+    // 两者的排查方向完全不同，混成一个码等于把这条线索丢掉。
+    expect(error).toBeInstanceOf(RequestTimeoutException);
+    expect((error as Error).message).toBe('这次回答超时了，请稍后再试');
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+  });
+
+  it('流式：预算到点后给一条 error 帧，连接正常收尾', async () => {
+    process.env.ASK_TIMEOUT_MS = '30';
+    const service = makeService(makePrisma(), hangingLlm());
+
+    const prepared = await service.prepare(DTO);
+    const events: AssistantStreamEvent[] = [];
+    for await (const event of service.streamAnswer(prepared)) events.push(event);
+
+    // 响应头早就发出去了，所以不是 504，而是一条用户看得见的 error 帧。
+    // 预算到点时 provider 是按「调用方取消」收场的（返回空流），
+    // 服务层要能认出「这是我掐的」，否则空文本会被报成「回答格式异常」。
+    expect(events).toEqual([
+      { type: 'error', message: '这次回答超时了，请稍后再试' },
+    ]);
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+  });
+
+  it('调用方自己取消不会被说成超时', async () => {
+    process.env.ASK_TIMEOUT_MS = '5000';
+    const service = makeService(makePrisma(), hangingLlm());
+    const prepared = await service.prepare(DTO);
+
+    const caller = new AbortController();
+    const events: AssistantStreamEvent[] = [];
+    const consuming = (async () => {
+      for await (const event of service.streamAnswer(prepared, caller.signal)) {
+        events.push(event);
+      }
+    })();
+
+    // 等流真的挂到模型上再取消，否则测到的只是「一开始就是 aborted」。
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    caller.abort();
+    await consuming;
+
+    // 用户关页面时不该弹任何错误 —— 那一刻已经没人看了。
+    expect(events).toEqual([]);
   });
 });
