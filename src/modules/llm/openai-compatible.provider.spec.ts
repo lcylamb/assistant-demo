@@ -84,6 +84,7 @@ function makeProvider(
     baseUrl,
     model: 'test-model',
     timeoutMs: 2_000,
+    maxAttempts: 3,
     maxTokens: 256,
     jsonMode: true,
     streamUsage: true,
@@ -411,6 +412,153 @@ describe('OpenAiCompatibleProvider', () => {
       );
 
       expect(error.message).toContain('超时');
+    });
+  });
+
+  describe('临时失败会重试，但不是什么都重试', () => {
+    it('503 是瞬时的：重试一次就好了', async () => {
+      let calls = 0;
+      const { baseUrl, requests } = await startVendor((res) => {
+        calls += 1;
+        if (calls === 1) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'overloaded' } }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            model: MODEL,
+            choices: [{ message: { role: 'assistant', content: '好' } }],
+          }),
+        );
+      });
+
+      const result = await makeProvider(baseUrl).complete(MESSAGES);
+
+      expect(result.text).toBe('好');
+      expect(requests).toHaveLength(2);
+    });
+
+    it('密钥错了不重试 —— 再试一百次也是同样的结果', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'bad key' } }));
+      });
+
+      const error = await failure(makeProvider(baseUrl).complete(MESSAGES));
+
+      expect(error.message).toContain('401');
+      expect(requests).toHaveLength(1);
+    });
+
+    it('厂商说「60 秒后再来」时不硬等 —— 直接告诉用户这次失败了', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        res.writeHead(429, {
+          'Retry-After': '60',
+          'Content-Type': 'application/json',
+        });
+        res.end(JSON.stringify({ error: { message: 'rate limited' } }));
+      });
+
+      const error = await failure(makeProvider(baseUrl).complete(MESSAGES));
+
+      // 等一分钟和直接失败，对用户来说是后者更诚实。
+      expect(error.message).toContain('429');
+      expect(requests).toHaveLength(1);
+    });
+
+    it('连接被重置也会重试 —— 这类失败来得快，重试便宜', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        // 请求收到了，但一个响应头都不给就掐断。
+        res.destroy();
+      });
+
+      await failure(makeProvider(baseUrl).complete(MESSAGES));
+
+      expect(requests).toHaveLength(3);
+    });
+
+    it('maxAttempts=1 时完全不重试', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'overloaded' } }));
+      });
+
+      await failure(
+        makeProvider(baseUrl, { maxAttempts: 1 }).complete(MESSAGES),
+      );
+
+      expect(requests).toHaveLength(1);
+    });
+
+    it('流式：第一次 503，重试成功后增量不会重复', async () => {
+      let calls = 0;
+      const { baseUrl, requests } = await startVendor((res) => {
+        calls += 1;
+        if (calls === 1) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'overloaded' } }));
+          return;
+        }
+        openStream(res);
+        res.write(textFrame('你'));
+        res.write(textFrame('好'));
+        res.end();
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      expect(await drain(stream.events)).toEqual(['你', '好']);
+      expect(requests).toHaveLength(2);
+    });
+
+    it('流式：响应头到了、首帧还没到连接就断了 —— 第一个字之前，可以重试', async () => {
+      let calls = 0;
+      const { baseUrl, requests } = await startVendor((res) => {
+        calls += 1;
+        if (calls === 1) {
+          openStream(res);
+          // 响应头写完了，一个数据帧都没有，连接就没了。
+          setTimeout(() => res.destroy(), 20);
+          return;
+        }
+        openStream(res);
+        res.write(textFrame('好'));
+        res.end();
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      expect(await drain(stream.events)).toEqual(['好']);
+      expect(requests).toHaveLength(2);
+    });
+
+    it('流式：首帧超时不重试 —— 已经等满一整个时限了', async () => {
+      const { baseUrl, requests } = await startVendor(() => {
+        // 连接建起来，但永远不响应。
+      });
+
+      const error = await failure(
+        makeProvider(baseUrl, { timeoutMs: 60 }).stream(MESSAGES),
+      );
+
+      expect(error.message).toContain('第一个字超时');
+      expect(requests).toHaveLength(1);
+    });
+
+    it('流式：已经开始吐字之后再出错，不重试 —— 否则同一段话会吐两遍', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        openStream(res);
+        res.write(textFrame('半句'));
+        // 吐了半句，然后把连接掐掉。
+        setTimeout(() => res.destroy(), 20);
+      });
+
+      const stream = await makeProvider(baseUrl).stream(MESSAGES);
+
+      await expect(drain(stream.events)).rejects.toThrow();
+      expect(requests).toHaveLength(1);
     });
   });
 

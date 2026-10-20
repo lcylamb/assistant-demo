@@ -4,6 +4,7 @@ import { DailyQuotaService } from './daily-quota.service.js';
 import { LLM_PROVIDER, type LlmProvider } from './llm.types.js';
 import { MockLlmProvider } from './mock-llm.provider.js';
 import {
+  DEFAULT_MAX_ATTEMPTS,
   DEFAULT_MAX_TOKENS,
   DEFAULT_TIMEOUT_MS,
   OpenAiCompatibleProvider,
@@ -54,6 +55,7 @@ export function createLlmProvider(config: ConfigService): LlmProvider {
         baseUrl: config.get<string>('LLM_BASE_URL') ?? '',
         model: config.get<string>('LLM_MODEL') ?? '',
         timeoutMs: positive(config, 'LLM_TIMEOUT_MS', DEFAULT_TIMEOUT_MS),
+        maxAttempts: positive(config, 'LLM_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS),
         maxTokens: positive(config, 'LLM_MAX_TOKENS', DEFAULT_MAX_TOKENS),
         // 默认开。要关掉是显式写 false，不是「没配就关」——
         // 对结构化输出这个项目来说，约束开着才是正常状态。

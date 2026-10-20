@@ -56,7 +56,7 @@ describe('createLlmProvider', () => {
     }
   });
 
-  it('超时 / 输出上限不是正数 → 启动失败，不退回默认值', () => {
+  it('超时 / 输出上限 / 重试次数不是正数 → 启动失败，不退回默认值', () => {
     expect(() =>
       createLlmProvider(makeConfig({ ...OPENAI, LLM_TIMEOUT_MS: 'abc' })),
     ).toThrow(/LLM_TIMEOUT_MS/);
@@ -64,5 +64,10 @@ describe('createLlmProvider', () => {
     expect(() =>
       createLlmProvider(makeConfig({ ...OPENAI, LLM_MAX_TOKENS: '0' })),
     ).toThrow(/LLM_MAX_TOKENS/);
+
+    // 0 次尝试没有意义，写成 1 才是「关掉重试」。
+    expect(() =>
+      createLlmProvider(makeConfig({ ...OPENAI, LLM_MAX_ATTEMPTS: '0' })),
+    ).toThrow(/LLM_MAX_ATTEMPTS/);
   });
 });
