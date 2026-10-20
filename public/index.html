@@ -674,6 +674,10 @@ async function ask() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
+    // 收到 done 或 error 才算「有结论」。服务端如果因为意外直接关了连接
+    // （没有这两种帧），循环也会正常结束 —— 不记这个标志的话，页面会永远
+    // 停在「生成中」，用户不知道是慢还是断了。
+    let settled = false;
 
     for (;;) {
       const { done, value } = await reader.read();
@@ -692,7 +696,12 @@ async function ask() {
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
 
-        const { name, data } = parseFrame(frame);
+        const parsed = parseFrame(frame);
+        // 心跳是注释帧（`: ping`），没有 data。规范要求客户端忽略它 ——
+        // 它存在的唯一目的，是让代理别把「工具轮里几秒钟没字」当成空闲连接掐掉。
+        if (!parsed) continue;
+
+        const { name, data } = parsed;
 
         if (name === 'delta') {
           if (firstDeltaAt === null) firstDeltaAt = performance.now();
@@ -702,12 +711,21 @@ async function ask() {
           bot.text.textContent += data.text;
           follow();
         } else if (name === 'done') {
+          settled = true;
           finish(bot, data, startedAt, firstDeltaAt, deltaChars);
           remember(question, data);
         } else if (name === 'error') {
+          settled = true;
           fail(bot, data.message);
         }
       }
+    }
+
+    // 流正常结束（EOF）但没等到终态帧：服务端在收口之前出了问题，或者
+    // 某个代理把连接关掉了。已经显示的字保留，但必须明确告诉用户「不完整」——
+    // 静默留在「生成中」是最坏的一种：看起来像卡住，实际早就结束了。
+    if (!settled) {
+      fail(bot, '连接提前结束了，这次回答不完整，请重试');
     }
   } catch (error) {
     if (error.name === 'AbortError') {
@@ -892,10 +910,14 @@ function follow() {
 }
 
 /**
- * 解析一个 SSE 帧。
+ * 解析一个 SSE 帧。**注释帧返回 null**。
  *
  * 按 SSE 规范，一个帧里的多行 `data:` 要用换行拼起来再解析。
  * 我们的服务只发一行，但照规范写是零成本，将来发多行也不会突然坏掉。
+ *
+ * 没有 `data:` 的帧是注释（心跳用的 `: ping`）。不返回 null 的话，
+ * `JSON.parse('')` 会抛异常，而它会被外层的 catch 当成一次真正的失败 ——
+ * 页面在第一次空闲之后就会报错。
  */
 function parseFrame(frame) {
   let name = 'message';
@@ -906,6 +928,7 @@ function parseFrame(frame) {
     else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
   }
 
+  if (dataLines.length === 0) return null;
   return { name, data: JSON.parse(dataLines.join('\n')) };
 }
 

@@ -97,19 +97,68 @@ export class AssistantController {
       }
     });
 
+    // ── 心跳 ──
+    //
+    // 工具轮里会有**几秒钟一个字节都不发**的空档：第一轮模型只回一个工具调用，
+    // 接着查库，再调第二次模型才出字。中间那条连接对代理来说是「空闲」的。
+    // nginx 的 `proxy_read_timeout` 默认 60 秒、Cloudflare 是 100 秒 ——
+    // 超了就直接断，用户看到的是「说到一半没了」，而后端日志里一切正常。
+    //
+    // 解法是发 SSE 的**注释帧**（`: ping`）：规范规定客户端必须忽略它，
+    // 但它是一个真实字节，代理的计时器因此重置。只在**确实空闲**了
+    // `SSE_HEARTBEAT_MS` 之后才发，正常出字的时候一个字都不多写。
+    //
+    // ⚠️ 发注释帧意味着**每一个读流的地方**都必须跳过没有 `data:` 的帧。
+    // 现在有四处：本文件、`test/support/sse.ts`、`public/index.html`、
+    // `scripts/ask-stream-probe.mjs` —— 少改一处，那一处就会在第一次空闲后炸。
+    const heartbeatMs = heartbeatIntervalMs();
+    let lastWriteAt = Date.now();
+    const heartbeat =
+      heartbeatMs > 0
+        ? setInterval(() => {
+            if (res.writableEnded) return;
+            if (Date.now() - lastWriteAt < heartbeatMs) return;
+            res.write(HEARTBEAT_FRAME);
+            lastWriteAt = Date.now();
+          }, heartbeatMs)
+        : undefined;
+
     try {
       for await (const event of this.assistant.streamAnswer(
         prepared,
         abort.signal,
       )) {
         writeEvent(res, event);
+        lastWriteAt = Date.now();
       }
     } finally {
+      if (heartbeat) clearInterval(heartbeat);
       // 用 finally：中途抛异常（比如序列化失败）时也要把连接关掉，
       // 否则这个响应永远不结束，客户端的 `reader.read()` 会一直挂着。
       res.end();
     }
   }
+}
+
+/** 空闲多久发一次心跳。15 秒远低于常见代理的 60/100 秒，也不至于把日志刷满。 */
+const DEFAULT_HEARTBEAT_MS = 15_000;
+
+const HEARTBEAT_FRAME = ': ping\n\n';
+
+/**
+ * 读 `SSE_HEARTBEAT_MS`。0 = 关掉（本地调试时想让原始流干净一点）。
+ *
+ * 非法值回落到默认值，**不能**让它变成 NaN：`setInterval(fn, NaN)` 在 Node 里
+ * 等于「越快越好」，会变成往连接上刷 ping 的死循环 —— 一个配错的环境变量
+ * 比没有心跳糟糕得多。
+ */
+function heartbeatIntervalMs(): number {
+  const raw = process.env.SSE_HEARTBEAT_MS?.trim();
+  if (!raw) return DEFAULT_HEARTBEAT_MS;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_HEARTBEAT_MS;
+  return value;
 }
 
 /**
