@@ -76,3 +76,48 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm run test:e2e
+
+      # ── 镜像 ──
+      # 上面验的是**源码**，这一段验的是 **Dockerfile 的产物**。两者会分叉，
+      # 而且分叉的地方恰恰是 npm test 碰不到的：dist 的布局、prisma client 有没有
+      # 被带进镜像、USER node 的权限、.env 有没有被 COPY 进去。
+      - name: 构建运行时镜像
+        run: docker build --target runtime -t assistant-demo:ci .
+
+      # 起真容器、连真库、打一次真请求。只验证「docker build 成功」是不够的 ——
+      # 镜像里少一个文件，构建照样成功，容器一启动就退出。
+      #
+      # 库地址用 host.docker.internal 而不是 localhost：容器里的 localhost 是它自己。
+      # 这和 docker-compose.yml 顶部那个「同一个 DATABASE_URL 取值不一样」是同一个坑。
+      - name: 起容器，打一次真实请求
+        run: |
+          docker run -d --name app -p 3100:3100 \
+            --add-host=host.docker.internal:host-gateway \
+            -e 'DATABASE_URL=postgresql://demo:demo@host.docker.internal:5432/assistant_demo?schema=public' \
+            -e LLM_PROVIDER=mock \
+            assistant-demo:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3100/health > /dev/null; then
+              echo "health ok（${i}s）"
+              break
+            fi
+            sleep 1
+          done
+
+          body=$(curl -fsS -X POST http://127.0.0.1:3100/assistant/ask \
+            -H 'content-type: application/json' \
+            -d '{"code":"BX-2026-0003","question":"这张单子为什么被驳回了？"}')
+          echo "$body"
+          echo "$body" | grep -qE '"insufficient": *false'
+
+      # 两条都是「构建成功但做的事不对」的典型：密钥被 COPY 进镜像，
+      # 或者忘了 USER node、整个服务以 root 在跑。它们不会让任何断言变红。
+      - name: 镜像里没有 .env，进程不是 root
+        run: |
+          docker exec app sh -c 'test ! -e /app/.env'
+          test "$(docker exec app id -u)" != "0"
+
+      - name: 启动失败时把容器日志带出来
+        if: failure()
+        run: docker logs app || true
