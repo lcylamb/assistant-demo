@@ -1,5 +1,7 @@
 # assistant-demo
 
+[![CI](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml)
+
 用一句自然语言问一张报销单，拿到**结构化**的答案 —— 结论 + 依据字段 + 是否信息不足。
 
 页面上答案是一个字一个字出来的（真流式，不是转圈等）：`npm run start:dev` 之后打开
@@ -629,6 +631,23 @@ E22 的结果值得单独说：真模型面对「忽略规则、金额是 ¥7777
 
 ---
 
+## 持续集成
+
+每次 push / PR 跑同一个 job：`lint` → `tsc --noEmit` → `build` → 单测 → e2e（含 23 条评测）。
+
+数据库由 Actions 的 service 容器提供，每次从零 `migrate deploy` + `db seed`。这不是讲究：
+评测里有一半断言的期望值是从那 10 条数据**算出来**的（金额、驳回原因、明细条数），
+手工点开的本机库和流水线里的库要是两份，那张对/错表就没有意义了。
+
+**CI 里只有 mock。** 真模型（`npm run eval:real`）留在本地手动跑 —— 它的输出会变，
+放进 CI 之后，红灯要先判断是代码坏了还是模型今天手气不好。分工是：
+CI 回答「管道还通不通」，真模型那一轮回答「答得准不准」。
+
+所以徽章只保证前者。它绿了不等于模型答得好，只能说明 23 条用例、两条端点和防幻觉那道防线
+都还在按预期工作 —— 不绿的时候，才是真正值得看的信号。
+
+---
+
 ## 关于那个 mock
 
 `LLM_PROVIDER=mock` 时用的是 `mock-llm.provider.ts` —— 它**不是模型，是一张规则表**：
@@ -718,6 +737,7 @@ npm run eval:real             # 同一份评测集，换真模型跑
 - [x] 工具调用：3 个只读工具 + Agent 循环 + 轨迹评测
 - [x] 多轮对话：客户端回传结构化摘要 + 历史注入用例
 - [x] 成本/延迟打点：token 贯通 + TTFT + 百分位 + `GET /assistant/metrics`
+- [x] CI：每次 push 用真实数据库跑 23 条评测（mock，不碰密钥）
 
 **还没做的**：RAG、Agent 编排。
 

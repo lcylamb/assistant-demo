@@ -1,0 +1,78 @@
+name: CI
+
+# 每次 push 和 PR 跑同一套：静态检查 → 构建 → 单测 → e2e（含 23 条评测）。
+#
+# ⚠️ 这里**只用 mock**，不配任何密钥。理由不是省钱，是可复现：
+# 真模型的输出会变，把它放进 CI，红了要先判断「代码坏了」还是「模型今天手气不好」。
+# 真模型那一轮（`npm run eval:real`）留在本地手动跑 ——
+# CI 回答「管道还通不通」，真模型回答「答得准不准」，两件事不该混在一个红灯里。
+#
+# 数据库用 Actions 的 service 容器，每次从零迁移 + seed：
+# 评测里有一半断言的期望值是**从这 10 条数据算出来**的（金额、驳回原因、明细条数），
+# 所以不能复用任何共享库，也不能依赖上一个人留下的状态。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 推一版改一版时，前一次的结果已经没有意义了 —— 直接取消，省的是排队时间。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: demo
+          POSTGRES_DB: assistant_demo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U demo -d assistant_demo"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+
+    env:
+      # 只在这个 job 里存在，和本机 .env、和部署平台都没有关系。
+      # 用户名密码是 service 容器自己的，用完即弃。
+      DATABASE_URL: postgresql://demo:demo@localhost:5432/assistant_demo?schema=public
+      LLM_PROVIDER: mock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 和 Dockerfile 的 NODE_IMAGE 对齐：CI 里绿了、镜像里却跑不起来，
+          # 是这类流水线最典型的一种假绿。
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      # migrate deploy 而不是 migrate dev：dev 会检查 drift、可能停下来等人确认，
+      # 而 CI 里没有人和它对话。deploy 只按 migrations 目录里已有的文件执行。
+      - run: npx prisma migrate deploy
+
+      # seed 是评测的夹具，不是「顺手造点数」。23 条用例里有相当一部分的期望值
+      # 是从这些数据算出来的 —— 手工点开的那个库和 CI 这个库必须是同一份。
+      - run: npx prisma db seed
+
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:e2e
