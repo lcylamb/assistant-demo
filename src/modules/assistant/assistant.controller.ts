@@ -8,6 +8,7 @@ import {
   Req,
   Res,
 } from '@nestjs/common';
+import { SkipThrottle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { AssistantMetricsService } from './assistant-metrics.service.js';
 import type { MetricsSnapshot } from './assistant-metrics.service.js';
@@ -29,7 +30,12 @@ export class AssistantController {
    * 重启清零。它也不记问题内容和单号 —— 统计不该顺手变成一份访问日志。
    *
    * 成本只在配了单价时出现（见 `assistant-metrics.service.ts` 顶部那段）。
+   *
+   * `@SkipThrottle()`：它不碰模型、不花钱，也不是用户会连着点的东西。
+   * 更重要的是限流现在按 IP **跨端点共用**一份额度（见 ip-throttler.guard.ts）——
+   * 看指标的人要是把额度吃掉了，真正提问的人就被挡在外面了。
    */
+  @SkipThrottle()
   @Get('metrics')
   metricsSnapshot(): MetricsSnapshot {
     return this.metrics.snapshot();

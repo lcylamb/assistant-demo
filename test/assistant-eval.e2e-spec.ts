@@ -921,6 +921,12 @@ describe('评测集 (e2e)', () => {
   let deterministic = false;
 
   beforeAll(async () => {
+    // 评测自己会在一分钟内打几十次模型（23 条用例 × 两条端点），而生产限流是
+    // 30 次/分/IP、两个端点共用一份（见 src/ip-throttler.guard.ts）。
+    // 不放开的话，跑到一半就会被自己的限流挡住 —— 那 13 条红的是额度，不是答案。
+    // 限流本身有专门的用例（test/rate-limit.e2e-spec.ts），这里要测的是回答质量。
+    process.env.RATE_LIMIT_PER_MINUTE = '10000';
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
@@ -960,6 +966,8 @@ describe('评测集 (e2e)', () => {
     // `beforeAll` 失败时这两个都可能没建起来 —— 原来的写法会在那里再抛一个
     // `Cannot read properties of undefined`，把真正的失败盖掉。
     warnSpy?.mockRestore();
+    // 还原 beforeAll 里放开的那条限流配置，别让它在同一个 worker 里漏给下一个文件。
+    delete process.env.RATE_LIMIT_PER_MINUTE;
     return app?.close();
   });
 

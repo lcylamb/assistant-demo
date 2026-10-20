@@ -1,8 +1,9 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
-import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller.js';
+import { IpThrottlerGuard } from './ip-throttler.guard.js';
 import { AssistantModule } from './modules/assistant/assistant.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 
@@ -53,7 +54,10 @@ import { PrismaModule } from './prisma/prisma.module.js';
     // 注册成全局守卫，而不是逐个路由挂 @UseGuards。
     // 理由和 ValidationPipe 一样：**默认开启**才防得住「新加了一个端点，
     // 忘了给它加限流」。漏掉一个端点不会报错，只会安静地敞着。
-    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    //
+    // 用自己那个按 IP 统一计数的版本（见 ip-throttler.guard.ts）：
+    // 库默认是按端点各算一份额度，那样两个模型端点加起来就是文档里那个数的两倍。
+    { provide: APP_GUARD, useClass: IpThrottlerGuard },
   ],
 })
 export class AppModule {}
