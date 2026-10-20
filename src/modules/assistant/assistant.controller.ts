@@ -7,6 +7,7 @@ import {
   Post,
   Req,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 import { SkipThrottle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
@@ -15,6 +16,7 @@ import type { MetricsSnapshot } from './assistant-metrics.service.js';
 import { AssistantService } from './assistant.service.js';
 import { AskDto } from './ask.dto.js';
 import type { AskResult, AssistantStreamEvent } from './ask.types.js';
+import { ModelConcurrencyGuard } from './model-concurrency.guard.js';
 
 @Controller('assistant')
 export class AssistantController {
@@ -50,6 +52,7 @@ export class AssistantController {
    */
   @Post('ask')
   @HttpCode(HttpStatus.OK)
+  @UseGuards(ModelConcurrencyGuard)
   ask(@Body() dto: AskDto): Promise<AskResult> {
     return this.assistant.ask(dto);
   }
@@ -63,8 +66,13 @@ export class AssistantController {
    * 注入 `@Res()` 还有个附带效果：Nest 不再管这个响应，返回值会被忽略。
    * 所以这个 handler 返回 `void`，不要返回别的 —— 返回了也不会被发出去，
    * 只会让读代码的人以为它在起作用。
+   *
+   * `@UseGuards(ModelConcurrencyGuard)` 必须挂在 handler 上而不是塞进 service：
+   * 守卫在 handler 之前跑，被并发上限挡回来的请求拿到的是一个正常的 429 JSON；
+   * 塞进 `streamAnswer()` 的话，那时响应头早就发出去了，只能变成流里的一条 error 帧。
    */
   @Post('askStream')
+  @UseGuards(ModelConcurrencyGuard)
   async askStream(
     @Body() dto: AskDto,
     @Req() req: Request,
