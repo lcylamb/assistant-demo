@@ -507,6 +507,43 @@ describe('OpenAiCompatibleProvider', () => {
       ).rejects.toThrow(/等待模型第一个字超时/);
     });
 
+    it('吐了一个字之后彻底沉默：不会无限等下去', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        res.write(textFrame('一'));
+        // 然后既不发帧也不 end —— 模拟「上游半死」：
+        // 连接看着还在，数据永远不来。心跳还会替它续命，症状是「生成中」一直转。
+      });
+
+      const stream = await makeProvider(baseUrl, { timeoutMs: 60 }).stream(MESSAGES);
+      const startedAt = Date.now();
+
+      // 关键是它在**时限附近**就结束，而不是挂到测试超时。
+      await expect(drain(stream.events)).rejects.toThrow(/停住/);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+    });
+
+    it('帧还在来就不算停住 —— 答得慢不该被腰斩', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        openStream(res);
+        let sent = 0;
+        const timer = setInterval(() => {
+          if (sent === 5) {
+            clearInterval(timer);
+            res.end();
+            return;
+          }
+          res.write(textFrame(String(sent)));
+          sent += 1;
+        }, 20);
+      });
+
+      // 每帧间隔 20ms、闲置上限 200ms：只要「每来一帧就重置计时器」是对的，
+      // 这条慢流就不会被掐。写成「整条流总时限」的话，这条会红。
+      const stream = await makeProvider(baseUrl, { timeoutMs: 200 }).stream(MESSAGES);
+      expect(await drain(stream.events)).toEqual(['0', '1', '2', '3', '4']);
+    });
+
     it('调用方取消：干净地结束，不抛', async () => {
       const { baseUrl } = await startVendor((res) => {
         openStream(res);
@@ -698,7 +735,7 @@ describe('OpenAiCompatibleProvider', () => {
       const { baseUrl } = await startVendor((res) => {
         openStream(res);
         // 只有工具碎片，一个文本帧都没有。首帧的判据如果只看文本，
-        // 这里会一直读到流结束才算「开口了」—— 而首帧超时会先到。
+        // `stream()` 会一直等到时限（60ms）才失败 —— 而这时它本该已经返回了。
         res.write(
           frame({
             model: MODEL,
@@ -713,11 +750,15 @@ describe('OpenAiCompatibleProvider', () => {
             ],
           }),
         );
-        setTimeout(() => res.end(), 200);
+        // 故意不 end、也不发文本。
+        //
+        // ⚠️ 这里**不消费 events**：这条用例只关心信封（stream()）能不能回来。
+        // 流末的沉默归下面那条「吐了一个字之后彻底沉默」管 —— 从这一版起，
+        // 帧与帧之间沉默过久本身就会被判成停住，消费它反而测不到首帧判定。
       });
 
       const stream = await makeProvider(baseUrl, { timeoutMs: 60 }).stream(MESSAGES);
-      expect(await drainEvents(stream.events)).toHaveLength(1);
+      expect(stream.model).toBe(MODEL);
     });
 
     it('流末尾那一帧用量会变成 usage 事件，请求里也开了 include_usage', async () => {

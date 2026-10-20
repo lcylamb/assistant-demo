@@ -40,7 +40,10 @@ export interface OpenAiCompatibleConfig {
   apiKey: string;
   baseUrl: string;
   model: string;
-  /** 单次调用的超时。流式只用它等第一个字，见 stream()。 */
+  /**
+   * 单次调用的超时。非流式是整个请求的上限；流式里它管两件事：
+   * 等第一个字，以及相邻两帧之间最多沉默多久（见 `nextFrame()`）。
+   */
   timeoutMs: number;
   /** 输出上限。答案是一句 JSON，这个值给的是「被刷时的爆炸半径」。 */
   maxTokens: number;
@@ -71,6 +74,12 @@ export interface OpenAiCompatibleConfig {
  */
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_TOKENS = 1024;
+
+/**
+ * 流式请求里「内部掐断」的原因。`null` = 没有内部掐断，那要是 aborted 就是调用方取消的。
+ * 见 `stream()` 里那段注释。
+ */
+type InternalAbort = 'first-token' | 'stalled' | null;
 
 export class OpenAiCompatibleProvider implements LlmProvider {
   readonly name = 'openai-compatible';
@@ -169,12 +178,18 @@ export class OpenAiCompatibleProvider implements LlmProvider {
      * 迭代中途断开、正常读完）都可能撞上它，每处各写一遍的话，
      * 迟早有一处把「用户关掉了页面」报成错误事件，而那时连接早就没了。
      *
-     * 用可变对象而不是一个 `let`：时限是在 `prime()` 里触发的，
-     * 这个标志要跨出那次调用，好让下面的 catch 分得清「超时」和「取消」——
+     * 用可变对象而不是一个 `let`：时限是在别的函数里触发的，
+     * 这个标志要跨出那次调用，好让 catch 分得清「内部掐断」和「调用方取消」——
      * 两者都会让 `controller.signal.aborted` 变成 true。
+     *
+     * 内部掐断分两种，报错话术不一样：
+     *   · `first-token`：连「模型开口了」都没等到（多半是厂商过载或鉴权）。
+     *   · `stalled`：先吐了字，然后彻底沉默（多半是连接被半死的中转挂住）。
+     * 两者分开，是因为看到日志的人要去的方向不同。
      */
-    const timing = { timedOut: false };
-    const callerAborted = () => controller.signal.aborted && !timing.timedOut;
+    const timing: { abortReason: InternalAbort } = { abortReason: null };
+    const callerAborted = () =>
+      controller.signal.aborted && timing.abortReason === null;
 
     // 工具调用的碎片流会在两个阶段被读到：`prime()` 为了确定模型名会先拉几帧，
     // 剩下的在消费端继续读。所以累加器必须**跨这两个阶段**存在，
@@ -182,7 +197,13 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     const toolCalls = new ToolCallAccumulator();
 
     try {
-      const primed = await this.prime(messages, options, controller, timing, toolCalls);
+      const primed = await this.prime(
+        messages,
+        options,
+        controller,
+        timing,
+        toolCalls,
+      );
       // 到这里模型名一定有了：要么从帧里捡到，要么退回配置值。
       // ⚠️ 退回来说明厂商一个 model 字段都没给，那这条流的来源就只能靠配置解释了。
       return {
@@ -193,6 +214,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
           toolCalls,
           detach,
           callerAborted,
+          controller,
+          timing,
         ),
       };
     } catch (error) {
@@ -203,7 +226,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         this.logger.log('调用方已取消，模型请求提前结束');
         return { model: this.config.model, events: emptyEvents() };
       }
-      if (timing.timedOut) {
+      if (timing.abortReason === 'first-token') {
         throw new Error(`等待模型第一个字超时（${this.config.timeoutMs} ms）`);
       }
       throw error;
@@ -229,11 +252,17 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     messages: LlmMessage[],
     options: LlmRequestOptions | undefined,
     controller: AbortController,
-    timing: { timedOut: boolean },
+    timing: { abortReason: InternalAbort },
     toolCalls: ToolCallAccumulator,
-  ): Promise<{ iterator: AsyncIterator<string>; model: string; first: string[] }> {
+  ): Promise<{
+    iterator: AsyncIterator<string>;
+    model: string;
+    first: string[];
+  }> {
     const deadline = setTimeout(() => {
-      timing.timedOut = true;
+      // 调用方先一步取消的话，原因已经定了，别把它改写成「超时」。
+      if (controller.signal.aborted) return;
+      timing.abortReason = 'first-token';
       controller.abort();
     }, this.config.timeoutMs);
 
@@ -269,9 +298,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 
       return { iterator, model, first };
     } finally {
-      // ⚠️ 时限**只盖住这一段**，不盖整条流。给它挂总时限的话，
-      // 长回答会被腰斩 —— 「首字迟迟不来」和「答得慢」是两种不同的失败，
-      // 只有前者该被判成超时。
+      // ⚠️ 这个时限**只盖住「等第一个字」这一段**，不盖整条流：给整条流挂总时限的话，
+      // 长回答会被腰斩 ——「首字迟迟不来」和「答得慢」是两种失败，只有前者该判成超时。
+      // 但下半段也不是完全不管：两帧之间沉默太久同样会掐断，见 nextFrame()。
       clearTimeout(deadline);
     }
   }
@@ -292,12 +321,18 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     toolCalls: ToolCallAccumulator,
     detach: () => void,
     callerAborted: () => boolean,
+    controller: AbortController,
+    timing: { abortReason: InternalAbort },
   ): AsyncGenerator<LlmStreamEvent> {
     try {
       for (const text of first) yield { type: 'text', text };
 
       for (;;) {
-        const { value, done } = await iterator.next();
+        const { value, done } = await this.nextFrame(
+          iterator,
+          controller,
+          timing,
+        );
         if (done) break;
 
         const delta = parseVendorDelta(value);
@@ -321,12 +356,52 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         this.logger.log('调用方已取消，模型流提前结束');
         return;
       }
+      if (timing.abortReason === 'stalled') {
+        throw new Error(
+          `模型流停住了：超过 ${this.config.timeoutMs} ms 没有新数据`,
+        );
+      }
       throw error;
     } finally {
       detach();
       // 消费方提前退出（客户端断开、或者上层主动不读了）时，这一句负责让
       // `sseDataFrames` 的 finally 跑到，那里会 cancel 掉底下的 body。
       await iterator.return?.(undefined).catch(() => undefined);
+    }
+  }
+
+  /**
+   * 读下一帧，并且给这次等待挂一个**闲置上限**。
+   *
+   * ── 为什么上半段有超时，不代表下半段也有 ──
+   *
+   * `prime()` 的时限只证明「厂商开口了」。一个半死的上游完全可以先吐一个字，
+   * 然后永远沉默：连接没断、`read()` 不返回、心跳还在替这条连接续命。
+   * 用户看到的是「生成中」一直转，服务端则一直占着一条连接和一个请求。
+   *
+   * ── 为什么是「帧与帧之间」而不是「整条流」 ──
+   *
+   * 整条流挂总时限会把答得慢的长回答腰斩。只要厂商还在发帧，多慢都该让它说完；
+   * 真正该判死的是**沉默**。所以计时器在每一帧到达时重置。
+   *
+   * 触发时 abort 掉 controller，底下的 body 会以 abort 错误结束，`next()` 随之抛。
+   */
+  private async nextFrame(
+    iterator: AsyncIterator<string>,
+    controller: AbortController,
+    timing: { abortReason: InternalAbort },
+  ): Promise<IteratorResult<string>> {
+    const timer = setTimeout(() => {
+      // 调用方先一步取消的话，原因已经定了，别改写它。
+      if (controller.signal.aborted) return;
+      timing.abortReason = 'stalled';
+      controller.abort();
+    }, this.config.timeoutMs);
+
+    try {
+      return await iterator.next();
+    } finally {
+      clearTimeout(timer);
     }
   }
 
