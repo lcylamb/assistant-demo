@@ -251,6 +251,11 @@ MOCK_MISBEHAVE=unknown-field npm run start:dev
 实测（`npm run probe:stream`）：`BX-2026-0003` 首字 155ms / 总耗时 778ms，
 客户端 300ms 时断开则服务端日志留下「客户端已断开」，并且**不会**再打「流式回答完成」。
 
+这条行为现在有自动化用例（`test/assistant-abort.e2e-spec.ts`），不再只靠手工观察：
+用原生 `fetch` 读到第一个增量后掐断连接，再轮询 `/assistant/metrics`，断言
+`aborted` +1、`ok` / `errors` 不变、首字延迟 +1，而总耗时分布**不变** ——
+被断开的请求时长是个下界，混进 p95 会让尾部看起来比实际更好。
+
 ### 诚实边界
 
 - 增量解析器不保证 `conclusion` 是顶层键，也不防别的字符串值里出现 `"conclusion"`

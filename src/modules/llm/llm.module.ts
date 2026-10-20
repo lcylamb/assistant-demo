@@ -27,40 +27,49 @@ import {
     {
       provide: LLM_PROVIDER,
       inject: [ConfigService],
-      useFactory: (config: ConfigService): LlmProvider => {
-        const kind = config.get<string>('LLM_PROVIDER') ?? 'mock';
-
-        switch (kind) {
-          case 'mock':
-            return new MockLlmProvider();
-
-          case 'openai':
-            return new OpenAiCompatibleProvider({
-              apiKey: config.get<string>('LLM_API_KEY') ?? '',
-              baseUrl: config.get<string>('LLM_BASE_URL') ?? '',
-              model: config.get<string>('LLM_MODEL') ?? '',
-              timeoutMs: positive(config, 'LLM_TIMEOUT_MS', DEFAULT_TIMEOUT_MS),
-              maxTokens: positive(config, 'LLM_MAX_TOKENS', DEFAULT_MAX_TOKENS),
-              // 默认开。要关掉是显式写 false，不是「没配就关」——
-              // 对结构化输出这个项目来说，约束开着才是正常状态。
-              jsonMode: config.get<string>('LLM_JSON_MODE') !== 'false',
-              // 同上：默认让厂商在流末尾报用量。少数兼容实现不认这个字段，用 false 关掉。
-              streamUsage: config.get<string>('LLM_STREAM_USAGE') !== 'false',
-            });
-
-          default:
-            // 不认识的取值直接让启动失败，不要悄悄退回 mock ——
-            // 「以为接了真模型、其实一直在跑假数据」是最坏的一种失败。
-            throw new Error(
-              `不支持的 LLM_PROVIDER：${kind}。当前只有 'mock' 和 'openai'。`,
-            );
-        }
-      },
+      useFactory: createLlmProvider,
     },
   ],
   exports: [LLM_PROVIDER, DailyQuotaService],
 })
 export class LlmModule {}
+
+/**
+ * 按配置造 provider。
+ *
+ * 单独导出而不是匿名写在 `useFactory` 里：这里的三条「宁可起不来」的规则
+ * （未知 provider、缺密钥、数字配置写错）都值得有测试，而匿名工厂只能在
+ * 起一整个 Nest 容器之后才摸得到 —— 为了测三个分支搭一个容器，不值得。
+ */
+export function createLlmProvider(config: ConfigService): LlmProvider {
+  const kind = config.get<string>('LLM_PROVIDER') ?? 'mock';
+
+  switch (kind) {
+    case 'mock':
+      return new MockLlmProvider();
+
+    case 'openai':
+      return new OpenAiCompatibleProvider({
+        apiKey: config.get<string>('LLM_API_KEY') ?? '',
+        baseUrl: config.get<string>('LLM_BASE_URL') ?? '',
+        model: config.get<string>('LLM_MODEL') ?? '',
+        timeoutMs: positive(config, 'LLM_TIMEOUT_MS', DEFAULT_TIMEOUT_MS),
+        maxTokens: positive(config, 'LLM_MAX_TOKENS', DEFAULT_MAX_TOKENS),
+        // 默认开。要关掉是显式写 false，不是「没配就关」——
+        // 对结构化输出这个项目来说，约束开着才是正常状态。
+        jsonMode: config.get<string>('LLM_JSON_MODE') !== 'false',
+        // 同上：默认让厂商在流末尾报用量。少数兼容实现不认这个字段，用 false 关掉。
+        streamUsage: config.get<string>('LLM_STREAM_USAGE') !== 'false',
+      });
+
+    default:
+      // 不认识的取值直接让启动失败，不要悄悄退回 mock ——
+      // 「以为接了真模型、其实一直在跑假数据」是最坏的一种失败。
+      throw new Error(
+        `不支持的 LLM_PROVIDER：${kind}。当前只有 'mock' 和 'openai'。`,
+      );
+  }
+}
 
 /**
  * 读一个正整数配置。
