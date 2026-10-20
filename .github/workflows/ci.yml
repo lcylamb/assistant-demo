@@ -118,6 +118,19 @@ jobs:
           docker exec app sh -c 'test ! -e /app/.env'
           test "$(docker exec app id -u)" != "0"
 
+      # 「优雅退出」由两处共同保证：Dockerfile 的 CMD 用 exec 形式（不然 SIGTERM
+      # 被 shell 吃掉）、main.ts 里 enableShutdownHooks（不然钩子不跑）。
+      # 任一处写错，症状都是静默的：进程被 SIGKILL，连接池悬着，没有任何报错。
+      # 退出码和最后那行日志是唯一能看见的证据。
+      - name: SIGTERM 走完钩子再退出（不是被 SIGKILL）
+        run: |
+          docker stop --time=10 app
+          code=$(docker inspect -f '{{.State.ExitCode}}' app)
+          echo "exit code: $code"
+          # 137 = 128 + 9，被 SIGKILL；0 才是自己收完尾走的。
+          test "$code" = "0"
+          docker logs app 2>&1 | grep -q '收到退出信号，数据库连接已释放'
+
       - name: 启动失败时把容器日志带出来
         if: failure()
         run: docker logs app || true

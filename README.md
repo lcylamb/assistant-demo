@@ -125,7 +125,9 @@ docker compose down           # 停（数据留在 volume 里）
 
 **探活用 `/health` 而不是查端口。** 端口开着但数据库连不上时，查端口会一直报健康。探针命令用 Node 自带的 `fetch`：alpine 里没有 `curl`，为了一个探针去 `apk add` 一个包不划算。
 
-**`CMD` 用 exec 形式（数组）。** shell 形式会让 node 变成 shell 的子进程，于是 `SIGTERM` 发给 shell、node 收不到，优雅退出永远不会触发。实测 `docker kill --signal=TERM` → 209ms 退出、退出码 0，日志里有 `收到退出信号，数据库连接已释放`（那行就是 `$disconnect` 跑完的证据）。
+**`CMD` 用 exec 形式（数组）。** shell 形式会让 node 变成 shell 的子进程，于是 `SIGTERM` 发给 shell、node 收不到，优雅退出永远不会触发。实测 `docker kill --signal=TERM` → 209ms 退出、退出码 0，日志里有 `收到退出信号，数据库连接已释放`（那行就是 `$disconnect` 跑完的证据）。这条现在是 CI 里的断言：`docker stop` 之后退出码必须是 0（137 就是被 SIGKILL 了），日志里必须有那一行。
+
+**连不上数据库就不启动。** `PrismaService.onModuleInit` 会真的发一条 `select 1` —— 换成 driver adapter 之后 `$connect()` 是惰性的，数据库不在也照样「成功」，只有发一条查询才能证伪。连不上直接抛，消息里带着起库和建表的命令。带病启动看起来更"优雅"，代价是把一次明确的配置错误摊成无数个 500，而每一个都长得像业务 bug。这条有自动化用例（`test/startup.e2e-spec.ts`）：把连接串指到 `127.0.0.1:1`，`app.init()` 必须拒绝。
 
 ### 一个很容易踩的坑：同一个 `DATABASE_URL` 取值不一样
 
