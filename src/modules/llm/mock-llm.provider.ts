@@ -121,6 +121,16 @@ const RULES: Array<{ match: RegExp; answer: (record: MockRecord) => MockAnswer }
           },
   },
   {
+    match: /申请人|谁提交|谁报的|哪个部门|什么部门|部门是/,
+    // 放在「提交」前面：问「是谁提交的」也含「提交」两个字，
+    // 先命中这条才不会只剩一个提交时间。
+    answer: (record) => ({
+      conclusion: `${record.code} 由${record.applicant}提交，所属部门：${record.department}。`,
+      evidence: ['code', 'applicant', 'department'],
+      insufficient: false,
+    }),
+  },
+  {
     match: /明细|构成|花在|什么费用|哪些费用|项目/,
     answer: (record) => {
       const items = record.items ?? [];
@@ -193,6 +203,7 @@ const RULES: Array<{ match: RegExp; answer: (record: MockRecord) => MockAnswer }
  */
 const TOOL_RULES: Array<{ match: RegExp; tool: string }> = [
   { match: /驳回|拒绝|不通过|没通过/, tool: 'get_approval_record' },
+  { match: /申请人|谁提交|谁报的|哪个部门|什么部门|部门是/, tool: 'get_expense_summary' },
   { match: /明细|构成|花在|什么费用|哪些费用|项目/, tool: 'list_expense_items' },
   { match: /多少钱|金额|总额|合计|花了多少/, tool: 'get_expense_summary' },
   { match: /审批|审批意见|批准|决定|决策|通过了吗/, tool: 'get_approval_record' },

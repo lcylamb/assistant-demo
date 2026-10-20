@@ -103,7 +103,10 @@ const listExpenseItems: AgentTool = {
         code: true,
         amount: true,
         items: {
-          orderBy: { spentOn: 'asc' },
+          // 第二排序键不是为了好看：同一天的多笔明细如果没有稳定顺序，
+          // 模型看到的数组下标每次都可能不同，它引用 `items[0].note` 就会时对时错。
+          // 日期 + 名称至少在同一个数据库上是确定的。
+          orderBy: [{ spentOn: 'asc' }, { name: 'asc' }],
           select: {
             name: true,
             category: true,

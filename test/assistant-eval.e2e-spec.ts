@@ -39,8 +39,8 @@ import { asResult, parseSse } from './support/sse.js';
  *    它先证明这些字符串真的在数据里 —— 否则用例会以一种**看起来像模型答错了**
  *    的方式失败，这种失败极难查。
  *
- * 3. **评测必须能红。** 十条全绿说明不了什么：一个永远绿的评测和没有评测是一样的。
- *    所以这里面有两条**已知会红**的用例（`knownGap`），它们红得有价值 ——
+ * 3. **评测必须能红。** 全绿说明不了什么：一个永远绿的评测和没有评测是一样的。
+ *    所以这里面有一批**已知会红**的用例（`knownGap`），它们红得有价值 ——
  *    说的正是「换成真模型之后必须重点盯哪两件事」。
  *    反过来，已知不足哪天不红了，用例会失败并要求把这个标记删掉，
  *    否则它会慢慢变成一张永久的免罪符。
@@ -133,7 +133,14 @@ function toRow(expense: ExpenseWithItems): RowData {
 // ─────────────────────────────────────────────────────────────
 
 interface CaseExpectation {
-  insufficient: boolean;
+  /**
+   * 该不该说「信息不足」。
+   *
+   * 少数用例不适用这个二选一 —— 比如「把它改成已通过」：正确答案是「做不到」，
+   * 但它既不是「信息不足」也不是「答出来了」。那种用例把这个字段留空，
+   * 用 `check` 断言能力边界本身。
+   */
+  insufficient?: boolean;
   /** 结论里必须出现的关键词。「有没有答到点上」的最低标准，不检查措辞。 */
   mustMention?: string[];
   evidenceIncludes?: string[];
@@ -165,7 +172,7 @@ interface EvalCase {
    * 已知答不了，写清**是谁**答不了。
    *
    * ⚠️ 它是 provider 的属性，不是用例的属性：同一张单子 mock 会踩坑，真模型可能答对。
-   * 早先这里只是一个字符串，结果在真模型上跑时那两条「已知不足」都被答对了，
+   * 早先这里只是一个字符串，结果在真模型上跑时那几条「已知不足」都被答对了，
    * 评测反过来要求把标记删掉 —— 可标记对 mock 仍然成立。
    * 所以必须带上 provider 名字，只在自己那个 provider 下生效。
    */
@@ -321,7 +328,230 @@ const CASES: EvalCase[] = [
     },
     expect: () => ({ insufficient: true }),
   },
+  {
+    id: 'E11',
+    code: 'BX-2026-0001',
+    question: '这张单子现在是什么状态？',
+    focus: '能答：当前状态（PAID）',
+    expectTools: ['get_expense_summary'],
+    expect: () => ({ insufficient: false, evidenceIncludes: ['status'] }),
+    // 数据里是英文枚举 PAID，用户听得懂的是「已支付」。两种都认，
+    // 但不接受它答成「待审批」这种别的状态 —— 那是读错了字段。
+    check: (result) =>
+      /PAID|已支付|已打款|已付款|已报销/.test(result.conclusion)
+        ? []
+        : ['结论里没答出「已支付」（数据里是 PAID）'],
+  },
+  {
+    id: 'E12',
+    code: 'BX-2026-0002',
+    question: '这张单子是谁提交的？是哪个部门的？',
+    focus: '能答：申请人与部门',
+    expectTools: ['get_expense_summary'],
+    // 两个值都从库里取。手写「李四」「研发部」的话，改 seed 就会让期望悄悄过期。
+    expect: (row) => ({
+      insufficient: false,
+      mustMention: [
+        String(row.context.record.applicant),
+        String(row.context.record.department),
+      ],
+      evidenceIncludes: ['applicant', 'department'],
+    }),
+  },
+  {
+    id: 'E13',
+    code: 'BX-2026-0003',
+    question: '审批是什么时候完成的？',
+    focus: '能答：审批时间（decidedAt）',
+    expectTools: ['get_approval_record'],
+    // decidedAt 只存在于审批记录里 —— 查表头拿不到。这条同时测「字段在哪块」。
+    expect: (row) => ({
+      insufficient: false,
+      mustMention: [row.decidedDate!],
+      evidenceIncludes: ['decidedAt'],
+    }),
+  },
+  {
+    id: 'E14',
+    code: 'BX-2026-0003',
+    question: '是谁审批的？',
+    focus: '信息不足：数据里没有审批人',
+    expectTools: ['get_approval_record'],
+    // 审批记录只有状态、时间、驳回原因，没有「审批人」这一列。
+    // 模型很容易拿申请人（王五）顶上去 —— 那是把两个角色混成一个。
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 的「审批」规则只会回答审批完成时间，没有「谁审批」这个概念；' +
+        '它会把问题当成「审批到哪一步」，于是声称信息充分。',
+    },
+    expect: () => ({ insufficient: true }),
+  },
+  {
+    id: 'E15',
+    code: 'BX-2026-0002',
+    question: '这张单子一共有几条明细？',
+    focus: '能答：明细条数',
+    expectTools: ['list_expense_items'],
+    expect: () => ({ insufficient: false, evidenceIncludes: ['items'] }),
+    check: (result, row) =>
+      mentionsCount(result.conclusion, row.itemNames.length)
+        ? []
+        : [`结论里没说清明细条数（应为 ${row.itemNames.length} 条）`],
+  },
+  {
+    id: 'E16',
+    code: 'BX-2026-0001',
+    question: '哪一笔金额最大？花了多少钱？',
+    focus: '推理：在明细里找最大值',
+    expectTools: ['list_expense_items'],
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 只按关键词匹配，没有「比较」这一步：「金额」规则直接回总额，' +
+        '它不会去明细里找最大的那一笔。这条测的是模型自己做比较的能力。',
+    },
+    expect: () => ({ insufficient: false, evidenceIncludes: ['items'] }),
+    check: (result, row) => {
+      const items = rowItems(row);
+      const top = items.reduce((best, item) =>
+        Number(item.amount) > Number(best.amount) ? item : best,
+      );
+      const problems: string[] = [];
+      // 明细名是「北京住宿 3 晚」，模型可能只写「住宿」——包含即可。
+      if (!result.conclusion.includes(top.name)) {
+        problems.push(`结论里没点名最大的一笔（${top.name}）`);
+      }
+      if (!moneyTokens(result.conclusion).includes(Math.round(Number(top.amount) * 100))) {
+        problems.push(`结论里没有最大一笔的金额 ${top.amount}`);
+      }
+      return problems;
+    },
+  },
+  {
+    id: 'E17',
+    code: 'BX-2026-0006',
+    question: '住宿一共花了多少钱？',
+    focus: '能答：某一类明细的合计',
+    expectTools: ['list_expense_items'],
+    knownGap: {
+      provider: 'mock',
+      reason:
+        '和 E16 同一个原因：规则表不会按名字筛明细再求和，「花了多少钱」直接命中总额规则。',
+    },
+    expect: () => ({ insufficient: false, evidenceIncludes: ['items'] }),
+    // 合计由明细现算，不手写。模型写「960 元」或「¥960.00」都认。
+    check: (result, row) => {
+      const cents = rowItems(row)
+        .filter((item) => item.name.includes('住宿'))
+        .reduce((sum, item) => sum + Math.round(Number(item.amount) * 100), 0);
+      return moneyTokens(result.conclusion).includes(cents)
+        ? []
+        : [`结论里没有住宿合计 ${formatCents(cents)}`];
+    },
+  },
+  {
+    id: 'E18',
+    code: 'BX-2026-0007',
+    question: '帮我把这张单子的状态改成已通过。',
+    focus: '能力边界：只读工具不能改数据',
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 没有「拒绝请求」这条路径，兜底规则会总结一遍单子，看起来像答应了却没有改。' +
+        '能力边界只有真模型才答得出来。',
+    },
+    // 不判 insufficient：正确答案是「做不到」，它既不是信息不足也不是答出来了。
+    expect: () => ({}),
+    check: (result) => {
+      const problems: string[] = [];
+      if (!/(不能|无法|做不到|不支持|只能|没有权限|仅支持|只读)/.test(result.conclusion)) {
+        problems.push('结论里没有说明「不能修改」—— 三个工具都是只读的');
+      }
+      if (/(已改|已经改|已更新|已设置为|修改成功|操作成功)/.test(result.conclusion)) {
+        problems.push('结论声称修改成功 —— 服务端根本没有写操作');
+      }
+      return problems;
+    },
+  },
+  {
+    id: 'E19',
+    code: 'BX-2026-0006',
+    question: '这张单子符合公司的差旅报销标准吗？',
+    focus: '信息不足：数据里没有制度标准',
+    // 数据里只有金额、日期、明细，没有任何「标准/限额」字段。
+    // 模型可以根据常识猜一个，但那正是评测要抓的「看起来合理但不来自数据」。
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 没命中任何规则，会退回总结单子并声称信息充分 —— ' +
+        '和 E10 同一种失败：它没意识到问题需要的字段不在数据里。',
+    },
+    expect: () => ({ insufficient: true }),
+  },
+  {
+    id: 'E20',
+    code: 'BX-2026-0010',
+    question: '这笔报销的明细里有没有说明还需要补什么材料？',
+    focus: '能答：明细备注（note）',
+    expectTools: ['list_expense_items'],
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 的明细规则只拼名称、分类和金额，`note` 根本没进它的输出 —— ' +
+        '它会把明细列一遍，但复述不出备注。',
+    },
+    expect: () => ({ insufficient: false, evidenceIncludes: ['items'] }),
+    // 备注就在这一笔明细的 note 上：「需附合同扫描件，提交前补齐」。
+    //
+    // ⚠️ 这条原来用的是 BX-2026-0001，真模型答对了内容，却引用 `items[0].note` ——
+    // 而备注实际在同一天的另一笔上。同一天的两笔明细**顺序没有保证**，
+    // 模型按仓库顺序引用下标就会指错。这不是评测太严：它确实引用了别处的字段。
+    // 换成只有一条明细的单子，下标不再有歧义。
+    check: (result) =>
+      /合同|扫描件/.test(result.conclusion)
+        ? []
+        : ['结论里没有复述备注里「需附合同扫描件」的意思'],
+  },
+  {
+    id: 'E21',
+    code: 'BX-2026-0003',
+    question: '提交时间和审批时间分别是哪天？',
+    focus: '跨工具取数：提交 + 审批',
+    // 提交时间在表头，审批时间在审批记录 —— 少查任何一个都答不全。
+    expectTools: ['get_expense_summary', 'get_approval_record'],
+    expect: (row) => ({
+      insufficient: false,
+      mustMention: [row.submittedDate, row.decidedDate!],
+      evidenceIncludes: ['submittedAt', 'decidedAt'],
+    }),
+    knownGap: {
+      provider: 'mock',
+      reason:
+        'mock 的「时间」规则只查表头，拿不到 decidedAt；它会把提交时间当成两个问题的答案。' +
+        '真模型该在这条上把两个工具都查一遍。',
+    },
+  },
 ];
+
+/** 明细列表的最小形状。`row.context.record` 是 `Record<string, unknown>`，这里收窄一次。 */
+function rowItems(row: RowData): Array<{ name: string; amount: string }> {
+  return (row.context.record.items as Array<{ name: string; amount: string }>) ?? [];
+}
+
+const CN_NUMERAL = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+
+/** 「3 条」「三条」「共 3 笔」都算答对了条数。 */
+function mentionsCount(text: string, count: number): boolean {
+  const forms = [`${count}`, CN_NUMERAL[count] ?? String(count)];
+  return forms.some(
+    (form) =>
+      text.includes(`${form} 条`) ||
+      text.includes(`${form}条`) ||
+      text.includes(`${form} 笔`) ||
+      text.includes(`${form}笔`),
+  );
+}
 
 // ─────────────────────────────────────────────────────────────
 // 通用检查：对每一条用例、两条端点都成立
@@ -375,7 +605,10 @@ function semanticProblems(c: EvalCase, result: AskResult, row: RowData): string[
   const expected = c.expect(row);
   const problems: string[] = [];
 
-  if (result.insufficient !== expected.insufficient) {
+  if (
+    expected.insufficient !== undefined &&
+    result.insufficient !== expected.insufficient
+  ) {
     problems.push(
       `insufficient 应为 ${expected.insufficient}，实际 ${result.insufficient}`,
     );
@@ -593,9 +826,13 @@ interface CaseResult {
   /** 这次实际调用过的工具名（按调用顺序，可能重复） */
   tools: string[];
   hallucinated: boolean;
+  /** 非流式那条端点的实测耗时。两次端点各测各的，这里只取一条做参照。 */
+  elapsedMs: number;
+  /** 厂商报的 token 总量；任一轮没报就是 null（不拿报了的几轮凑）。 */
+  tokens: number | null;
 }
 
-/** 多轮用例单独出表：它的「通过」含义和前十条不一样（见多轮那一节）。 */
+/** 多轮用例单独出表：它的「通过」含义和主表不一样（见多轮那一节）。 */
 interface MultiTurnResult {
   id: string;
   focus: string;
@@ -691,6 +928,46 @@ describe('评测集 (e2e)', () => {
     const trap = rows.get('BX-2026-0006');
     expect(trap?.submittedDate.startsWith('2026-04')).toBe(true);
     expect(trap?.spentDateVariants.some((d) => d.startsWith('2026-03'))).toBe(true);
+
+    // ── 新增用例的前提 ──
+    // 这些断言的作用和上面一样：如果数据变了，先在这里炸，而不是让用例
+    // 以一种「模型答错了」的样子失败。
+
+    // E13/E21：0003 有审批时间，而且和提交时间不是同一天
+    // （同一天的话，「分别是哪天」这条就算模型只答了一个也看不出来）。
+    const decided = rows.get('BX-2026-0003');
+    expect(decided?.decidedDate).toBeDefined();
+    expect(decided?.submittedDate).not.toBe(decided?.decidedDate);
+
+    // E14：审批记录里**确实没有**「审批人」这个字段 —— 否则「信息不足」是错的期望。
+    expect(
+      decided?.context.availableFields.some((field) => /approver/i.test(field)),
+    ).toBe(false);
+
+    // E19：整份数据里也没有任何「标准 / 限额」字段。
+    expect(
+      trap?.context.availableFields.some((field) =>
+        /policy|standard|limit|budget/i.test(field),
+      ),
+    ).toBe(false);
+
+    // E16 依赖「金额最大的一笔是唯一的」；打平的话「哪一笔」就没有唯一答案。
+    const amounts = rowItems(rows.get('BX-2026-0001')!)
+      .map((item) => Number(item.amount))
+      .sort((a, b) => a - b);
+    expect(amounts.at(-1)).toBeGreaterThan(amounts.at(-2) ?? 0);
+
+    // E17 依赖 0006 的明细里真的有「住宿」这一项。
+    expect(
+      rows.get('BX-2026-0006')?.itemNames.some((name) => name.includes('住宿')),
+    ).toBe(true);
+
+    // E20 依赖 0010 的明细里真的有备注。用单条明细的单子，
+    // 是为了避免「同一天两笔、顺序不定」导致的数组下标歧义。
+    const noted = rowItems(rows.get('BX-2026-0010')!)[0] as {
+      note?: string;
+    };
+    expect(noted?.note).toContain('合同');
   });
 
   it.each(CASES)('$id｜$code｜$focus', async (c) => {
@@ -720,7 +997,7 @@ describe('评测集 (e2e)', () => {
     //   · 结论的语义（该不该说信息不足、答没答到点上）—— knownGap 豁免的就是这一类。
     //
     // 分开这件事是变异测试逼出来的：把 `dropUnknownEvidence` 拆掉之后，
-    // 两条 knownGap 用例照样显示「已知不足」，而它们其实已经在编字段了 ——
+    // knownGap 用例照样显示「已知不足」，而它们其实已经在编字段了 ——
     // 一个标记把管道故障一起盖住了。
     const structural = [
       ...structuralProblems(awaited, row!.context),
@@ -795,6 +1072,10 @@ describe('评测集 (e2e)', () => {
       chars: [joined.length, viaStream?.conclusion.length ?? 0],
       tools: awaited.trace.map((step) => step.tool),
       hallucinated,
+      elapsedMs: awaited.metrics.elapsedMs,
+      tokens: awaited.metrics.usage
+        ? awaited.metrics.usage.promptTokens + awaited.metrics.usage.completionTokens
+        : null,
     });
 
     if (gap && structural.length === 0) {
@@ -825,7 +1106,7 @@ describe('评测集 (e2e)', () => {
 
     it('编出来的字段会被剔除，请求本身仍然成功', async (ctx) => {
       // 这条不是在测模型，是在测**防线本身还活着**。
-      // 前面十条用例全绿也可能是「防线根本没被触发过」，
+      // 前面那些用例全绿也可能是「防线根本没被触发过」，
       // 只有主动喂一次幻觉，才能证明它真的会拦。
       requiresMock(ctx);
       process.env.MOCK_MISBEHAVE = 'unknown-field';
@@ -1068,9 +1349,12 @@ function printReport(
   const columns = [
     { title: '用例', width: 6 },
     { title: '单号', width: 14 },
-    { title: '测什么', width: 26 },
+    { title: '测什么', width: 30 },
     { title: '工具', width: 12 },
     { title: '增量/最终', width: 12 },
+    // 耗时和用量的口径见 README「成本与延迟」：耗时取自非流式那条端点，
+    // 用量是这一轮所有模型调用之和（任一轮没报就印「—」，不印 0）。
+    { title: '耗时/用量', width: 13 },
     { title: '判定', width: 12 },
   ];
 
@@ -1103,7 +1387,11 @@ function printReport(
         pad(r.focus, columns[2].width),
         pad(toolLabels(r.tools), columns[3].width),
         pad(`${r.chars[0]} / ${r.chars[1]}`, columns[4].width),
-        pad(VERDICT_LABEL[r.verdict], columns[5].width),
+        pad(
+          `${(r.elapsedMs / 1000).toFixed(1)}s / ${r.tokens ?? '—'}`,
+          columns[5].width,
+        ),
+        pad(VERDICT_LABEL[r.verdict], columns[6].width),
       ].join(' │ '),
     );
   }
