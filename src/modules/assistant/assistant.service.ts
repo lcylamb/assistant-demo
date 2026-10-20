@@ -293,6 +293,17 @@ export class AssistantService {
     );
   }
 
+  /**
+   * 流式路径上「客户端走了」的统一收场。
+   *
+   * 只留一行 log，不给 error 帧：连接那头已经没人了，帧发出去也没人收。
+   * 三处调用点曾经各抄一行同样的字符串，漏改一处的症状是日志里少一行 ——
+   * 不会有测试因此变红，所以收成一处。
+   */
+  private logStreamAborted(session: AgentSession): void {
+    this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+  }
+
   /** 非流式的 Agent 循环。抽出来是为了让 `ask()` 能用 try/catch 统一打点。 */
   private async runAgent(
     session: AgentSession,
@@ -375,6 +386,20 @@ export class AssistantService {
 
     try {
       for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
+        // 上一轮的工具可能刚好把预算用完，或者用户就是在那一轮里关掉了页面。
+        // 在**开始下一轮之前**判，和 `ask()` 的循环顶一样：模型调用和额度都是
+        // 真金白银，不值得为一个不会有人看的答案再花一份。
+        if (budget.expired()) {
+          this.logTimeout(session);
+          outcome = 'error';
+          yield { type: 'error', message: ASK_TIMEOUT_MESSAGE };
+          return;
+        }
+        if (callerSignal?.aborted) {
+          this.logStreamAborted(session);
+          return;
+        }
+
         // 额度检查在**这里**，不能像 ask() 那样抛异常：controller 早就把 SSE 的
         // 响应头发给浏览器了，那时再抛只会把连接搞断，用户什么也看不到。
         // 所以超限的表示方式是流里的一个 error 事件 —— 前端已经会渲染它。
@@ -399,7 +424,7 @@ export class AssistantService {
             return;
           }
           if (callerSignal?.aborted) {
-            this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+            this.logStreamAborted(session);
             return;
           }
           this.logModelFailure(error);
@@ -458,7 +483,7 @@ export class AssistantService {
             return;
           }
           if (callerSignal?.aborted) {
-            this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+            this.logStreamAborted(session);
             return;
           }
           this.logModelFailure(error);
@@ -478,7 +503,7 @@ export class AssistantService {
         }
 
         if (callerSignal?.aborted) {
-          this.logger.log(`客户端已断开，${session.code} 的流提前结束`);
+          this.logStreamAborted(session);
           return;
         }
 

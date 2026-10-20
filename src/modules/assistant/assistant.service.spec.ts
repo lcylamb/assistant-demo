@@ -91,6 +91,8 @@ function makePrisma(
   options: {
     failPrepare?: Error;
     failTools?: boolean | Error;
+    /** 工具查询慢多少毫秒。用来测「工具跑到一半预算到点」。 */
+    slowToolsMs?: number;
   } = {},
 ) {
   const findUnique = vi.fn(
@@ -99,6 +101,12 @@ function makePrisma(
       if (select.id) {
         if (options.failPrepare) throw options.failPrepare;
         return { id: 'exp_1' };
+      }
+
+      if (options.slowToolsMs) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, options.slowToolsMs),
+        );
       }
 
       if (options.failTools) {
@@ -131,8 +139,12 @@ function prismaError(code: string): Prisma.PrismaClientKnownRequestError {
   );
 }
 
-function makeService(prisma: ReturnType<typeof makePrisma>, llm: LlmProvider) {
-  const quota = { consume: () => true } as unknown as DailyQuotaService;
+function makeService(
+  prisma: ReturnType<typeof makePrisma>,
+  llm: LlmProvider,
+  // 默认不限额；要断言「一次都没花」的用例传一个记数的桩进来。
+  quota: Pick<DailyQuotaService, 'consume'> = { consume: () => true },
+) {
   const measurements: RequestMeasurement[] = [];
   const metrics = {
     record: (measurement: RequestMeasurement) => measurements.push(measurement),
@@ -141,7 +153,7 @@ function makeService(prisma: ReturnType<typeof makePrisma>, llm: LlmProvider) {
   const service = new AssistantService(
     prisma as unknown as PrismaService,
     llm,
-    quota,
+    quota as DailyQuotaService,
     metrics,
   );
   // 挂上去是为了让用例能断言「打点真的记了」，而不用起一整个 Nest 容器。
@@ -569,37 +581,37 @@ describe('AssistantService（Agent 循环）', () => {
   });
 });
 
+/** 按轮次回预设事件流的模型。 */
+function streamingLlm(rounds: LlmStreamEvent[][]): LlmProvider & {
+  calls: LlmMessage[][];
+} {
+  const calls: LlmMessage[][] = [];
+  let index = 0;
+
+  return {
+    name: 'scripted',
+    calls,
+    async complete(): Promise<LlmCompletion> {
+      throw new Error('这个用例不走非流式');
+    },
+    async stream(
+      messages: LlmMessage[],
+      _options?: LlmRequestOptions,
+    ): Promise<LlmStream> {
+      calls.push(structuredClone(messages));
+      const events = rounds[index++];
+      if (!events) throw new Error('假模型的脚本用完了');
+      return {
+        model: 'scripted',
+        events: (async function* () {
+          yield* events;
+        })(),
+      };
+    },
+  };
+}
+
 describe('AssistantService.streamAnswer（带工具的流）', () => {
-  /** 按轮次回预设事件流的模型。 */
-  function streamingLlm(rounds: LlmStreamEvent[][]): LlmProvider & {
-    calls: LlmMessage[][];
-  } {
-    const calls: LlmMessage[][] = [];
-    let index = 0;
-
-    return {
-      name: 'scripted',
-      calls,
-      async complete(): Promise<LlmCompletion> {
-        throw new Error('这个用例不走非流式');
-      },
-      async stream(
-        messages: LlmMessage[],
-        _options?: LlmRequestOptions,
-      ): Promise<LlmStream> {
-        calls.push(structuredClone(messages));
-        const events = rounds[index++];
-        if (!events) throw new Error('假模型的脚本用完了');
-        return {
-          model: 'scripted',
-          events: (async function* () {
-            yield* events;
-          })(),
-        };
-      },
-    };
-  }
-
   async function collect(
     service: AssistantService,
     session?: AgentSession,
@@ -776,6 +788,71 @@ describe('AssistantService（请求预算）', () => {
 
     // 用户关页面时不该弹任何错误 —— 那一刻已经没人看了。
     expect(events).toEqual([]);
+  });
+});
+
+describe('AssistantService（流式：开跑之前就断开）', () => {
+  const saved = process.env.ASK_TIMEOUT_MS;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (saved === undefined) delete process.env.ASK_TIMEOUT_MS;
+    else process.env.ASK_TIMEOUT_MS = saved;
+  });
+
+  it('信号在开流前就已经 aborted：不调模型、不扣额度、不吐任何事件', async () => {
+    process.env.ASK_TIMEOUT_MS = '5000';
+    const llm = streamingLlm([]);
+    const consume = vi.fn(() => true);
+    const service = makeService(makePrisma(), llm, { consume });
+
+    const prepared = await service.prepare(DTO);
+    const caller = new AbortController();
+    caller.abort();
+
+    const events: AssistantStreamEvent[] = [];
+    for await (const event of service.streamAnswer(prepared, caller.signal)) {
+      events.push(event);
+    }
+
+    // 一条帧都没有：连接那头已经没人了，发 error 也没人收。
+    expect(events).toEqual([]);
+    // 模型和额度都是钱。用户在查库那一小段时间里走了，这两样都不该花。
+    expect(llm.calls).toHaveLength(0);
+    expect(consume).not.toHaveBeenCalled();
+    // 取消不是失败：记 aborted，别把「用户关页面」算进错误率。
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'aborted' }),
+    ]);
+  });
+
+  it('预算在工具轮里到点：下一轮既不再调模型，也不再扣额度', async () => {
+    process.env.ASK_TIMEOUT_MS = '20';
+    // 工具查询比预算慢：预算在 await 工具的时候到点，下一轮循环顶上就该停。
+    const llm = streamingLlm([
+      [{ type: 'tool_call', call: toolCall('get_approval_record') }],
+    ]);
+    const consume = vi.fn(() => true);
+    const service = makeService(makePrisma({ slowToolsMs: 60 }), llm, {
+      consume,
+    });
+
+    const prepared = await service.prepare(DTO);
+    const events: AssistantStreamEvent[] = [];
+    for await (const event of service.streamAnswer(prepared)) {
+      events.push(event);
+    }
+
+    // 超时要告诉用户（响应头早就发出去了，只能走 error 帧）。
+    expect(events).toEqual([
+      { type: 'error', message: '这次回答超时了，请稍后再试' },
+    ]);
+    // 已经花掉的那一轮工具和模型钱收不回来了；能省的是**下一轮**。
+    expect(llm.calls).toHaveLength(1);
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
   });
 });
 

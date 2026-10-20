@@ -90,10 +90,28 @@ export class AssistantController {
     @Req() req: Request,
     @Res() res: Response,
   ): Promise<void> {
+    // 取消信号必须在 `prepare()` **之前**挂上：查库那一小段时间里用户也可能走。
+    // 挂晚了的话 `close` 早就触发过了，监听器永远等不到 —— 接下来照样把响应头
+    // 写到一个死连接上，再叫一次模型、吃掉一次额度。
+    const abort = new AbortController();
+    res.on('close', () => {
+      // ⚠️ 这里必须判 `writableEnded`。
+      // 响应正常写完时 `close` 也会触发，光看 `close` 分不清「用户走了」
+      // 和「我们写完了」—— 前者要掐掉模型请求，后者什么都不用做。
+      if (!res.writableEnded) {
+        abort.abort();
+      }
+    });
+
     // ⚠️ 取数必须在写响应头**之前**完成：它可能抛 404，
     // 而头一旦发出去，就再也没法返回一个正常的 JSON 错误了 ——
     // 只能把错误塞进流里，但那对调用方是完全不同的语义。
     const prepared = await this.assistant.prepare(dto);
+
+    // 取数期间用户就走了：不写头、不开模型，直接收场。
+    // `res.destroyed` 兜的是「`close` 在监听器挂上之前就触发过」的那种时序 ——
+    // 那时 `abort.signal` 还是干净的，但连接已经没了。
+    if (abort.signal.aborted || res.destroyed) return;
 
     res.status(HttpStatus.OK);
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -106,16 +124,6 @@ export class AssistantController {
     // 上面几行只是排队，这一句才真的把头发出去。不 flush 的话，
     // 响应头会一直等到第一次 `res.write` 才走 —— 那时错误已经来不及改了。
     res.flushHeaders();
-
-    const abort = new AbortController();
-    res.on('close', () => {
-      // ⚠️ 这里必须判 `writableEnded`。
-      // 响应正常写完时 `close` 也会触发，光看 `close` 分不清「用户走了」
-      // 和「我们写完了」—— 前者要掐掉模型请求，后者什么都不用做。
-      if (!res.writableEnded) {
-        abort.abort();
-      }
-    });
 
     // ── 心跳 ──
     //
