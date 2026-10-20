@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   HttpStatus,
   Post,
@@ -8,13 +9,31 @@ import {
   Res,
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { AssistantMetricsService } from './assistant-metrics.service.js';
+import type { MetricsSnapshot } from './assistant-metrics.service.js';
 import { AssistantService } from './assistant.service.js';
 import { AskDto } from './ask.dto.js';
 import type { AskResult, AssistantStreamEvent } from './ask.types.js';
 
 @Controller('assistant')
 export class AssistantController {
-  constructor(private readonly assistant: AssistantService) {}
+  constructor(
+    private readonly assistant: AssistantService,
+    private readonly metrics: AssistantMetricsService,
+  ) {}
+
+  /**
+   * 打点快照。
+   *
+   * ⚠️ 这是**进程内存**里的统计，不是全局统计：多实例部署时打到谁只看得到谁，
+   * 重启清零。它也不记问题内容和单号 —— 统计不该顺手变成一份访问日志。
+   *
+   * 成本只在配了单价时出现（见 `assistant-metrics.service.ts` 顶部那段）。
+   */
+  @Get('metrics')
+  metricsSnapshot(): MetricsSnapshot {
+    return this.metrics.snapshot();
+  }
 
   /**
    * POST 而不是 GET：问题在 body 里。中文进 URL 会被各级日志和代理原样记下来，

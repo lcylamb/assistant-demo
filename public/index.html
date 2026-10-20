@@ -507,6 +507,15 @@ const TOOL_LABEL = {
 let currentCode = 'BX-2026-0003';
 let controller = null;
 
+/**
+ * 当前这张单子的对话历史 —— 只存上一轮**被校验过**的三个字段，不存原文。
+ *
+ * 服务端不存会话（见 README「多轮」），所以历史由页面负责回传。存结构化摘要
+ * 而不是整段对话，有两个直接后果：请求体不会随轮数越变越大；
+ * 历史里也不会混进「流到一半被打断」那种没经过最终校验的半句话。
+ */
+let history = [];
+
 // ---------------------------------------------------------------- 初始化
 
 for (const item of EXPENSES) {
@@ -552,6 +561,11 @@ for (const preset of PRESETS) {
 setCode(currentCode);
 
 function setCode(code) {
+  // 换单子就换话题：历史是「这张单子」的上下文，带过去会诱导模型把上一张的
+  // 结论当成这一张的依据。服务端虽然会按本次单号重新查数据，但结论里的
+  // 具体数字来自历史，那是最难被发现的一种串台。
+  if (code !== currentCode) history = [];
+
   currentCode = code;
   $('codeValue').textContent = code;
   for (const row of $('codeList').children) {
@@ -634,11 +648,16 @@ async function ask() {
   let firstDeltaAt = null;
   let deltaChars = 0;
 
+  // 快照：请求飞出去之后 history 还可能被别的操作改掉（比如用户换了单号），
+  // 而这次请求该带的是「发出去那一刻」的上下文。
+  const turns = history.slice(-3);
+  const payload = turns.length > 0 ? { code, question, history: turns } : { code, question };
+
   try {
     const response = await fetch('/assistant/askStream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, question }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
@@ -684,6 +703,7 @@ async function ask() {
           follow();
         } else if (name === 'done') {
           finish(bot, data, startedAt, firstDeltaAt, deltaChars);
+          remember(question, data);
         } else if (name === 'error') {
           fail(bot, data.message);
         }
@@ -789,9 +809,16 @@ function finish(bot, result, startedAt, firstDeltaAt, deltaChars) {
   }
 
   const elapsed = (at) => (at === null ? '—' : `${Math.round(at - startedAt)} ms`);
+  // 用量来自厂商，服务端刻意不拿「报了的几轮」凑整次请求：任一轮没报就是 null。
+  // 所以这里必须把「没报」和「是 0」分开显示 —— 一个半截统计戴上精确的外表最危险。
+  const usage = result.metrics?.usage ?? null;
+  const tokens = usage
+    ? `<b>${usage.promptTokens + usage.completionTokens}</b> tokens`
+    : 'tokens <b>未报</b>';
   bot.metrics.innerHTML =
     `首字延迟 <b>${elapsed(firstDeltaAt)}</b>` +
     `　·　总耗时 <b>${Math.round(performance.now() - startedAt)} ms</b>` +
+    `　·　${tokens}` +
     `　·　增量 <b>${deltaChars}</b> 字　·　最终 <b>${result.conclusion.length}</b> 字`;
 
   // trace 是「这个回答是怎么来的」的唯一可见证据：模型自己决定查了什么。
@@ -806,6 +833,30 @@ function finish(bot, result, startedAt, firstDeltaAt, deltaChars) {
     line.textContent = `　·　查了 ${tools.join(' → ')}`;
     bot.metrics.appendChild(line);
   }
+}
+
+/**
+ * 记一轮历史。
+ *
+ * ⚠️ 只在 `done` 帧上记，而且只记结果里那三个字段。流被中断（用户点停止、断网）
+ * 时不记 —— 那时屏幕上那些字没经过 `parseAnswer`，把它当上下文带进下一轮，
+ * 等于让一段没校验的文本反过来影响后面的答案。历史里只收「已确认」的结论。
+ *
+ * 最多留 3 轮：后端 DTO 的上限就是 3，多带会被 400 打回来。
+ *
+ * 长度也在这里裁到 DTO 的上限。这是**输出回灌成输入**带来的不对称：
+ * 服务端没有限制 `conclusion` 的长度（模型写得长是它的事），但历史里的结论
+ * 超过 500 字，下一次请求就会被 DTO 拒掉 —— 用户看到的是「追问突然失败」。
+ * 宁可这一轮的历史短一点，也不要让一次成功的一问一答把下一问变成 400。
+ */
+function remember(question, result) {
+  history.push({
+    question: question.slice(0, 200),
+    conclusion: result.conclusion.slice(0, 500),
+    evidence: result.evidence.slice(0, 16).map((field) => field.slice(0, 64)),
+    insufficient: result.insufficient,
+  });
+  if (history.length > 3) history.splice(0, history.length - 3);
 }
 
 /** 中途失败：网络断了、格式校验没过、或者服务端 yield 了一个 error 事件。 */

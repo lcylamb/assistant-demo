@@ -86,6 +86,7 @@ function makeProvider(
     timeoutMs: 2_000,
     maxTokens: 256,
     jsonMode: true,
+    streamUsage: true,
     ...overrides,
   });
 }
@@ -167,6 +168,48 @@ describe('OpenAiCompatibleProvider', () => {
         // 调用方可以无脑读 `completion.toolCalls.length`，不用先判存在。
         toolCalls: [],
       });
+    });
+
+    it('把厂商报的用量带回来；没报时是 undefined，不是 0', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            model: MODEL,
+            choices: [{ message: { content: 'ok' } }],
+            usage: { prompt_tokens: 120, completion_tokens: 8 },
+          }),
+        );
+      });
+
+      expect((await makeProvider(baseUrl).complete(MESSAGES)).usage).toEqual({
+        promptTokens: 120,
+        completionTokens: 8,
+      });
+
+      // 另一台厂商什么都不报。这里必须是 undefined：「这笔没花 token」和
+      // 「不知道花了多少」在成本核算上是两件事，用 0 冒充会让总额偏低。
+      const silent = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: MODEL, choices: [{ message: { content: 'ok' } }] }));
+      });
+
+      expect((await makeProvider(silent.baseUrl).complete(MESSAGES)).usage).toBeUndefined();
+    });
+
+    it('只报了一半用量的实现按「没报」处理 —— 半份数据不能拿去算钱', async () => {
+      const { baseUrl } = await startVendor((res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            model: MODEL,
+            choices: [{ message: { content: 'ok' } }],
+            usage: { prompt_tokens: 120 },
+          }),
+        );
+      });
+
+      expect((await makeProvider(baseUrl).complete(MESSAGES)).usage).toBeUndefined();
     });
 
     it('请求按约定拼好', async () => {
@@ -675,6 +718,46 @@ describe('OpenAiCompatibleProvider', () => {
 
       const stream = await makeProvider(baseUrl, { timeoutMs: 60 }).stream(MESSAGES);
       expect(await drainEvents(stream.events)).toHaveLength(1);
+    });
+
+    it('流末尾那一帧用量会变成 usage 事件，请求里也开了 include_usage', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        openStream(res);
+        res.write(textFrame('好'));
+        // 厂商在 [DONE] 之前单独发一帧：choices 为空，只有 usage。
+        // 把它当成「没有内容」丢掉，流式端点就永远没有 token 数。
+        res.write(
+          frame({
+            model: MODEL,
+            choices: [],
+            usage: { prompt_tokens: 30, completion_tokens: 5 },
+          }),
+        );
+        res.end('data: [DONE]\n\n');
+      });
+
+      const events = await drainEvents((await makeProvider(baseUrl).stream(MESSAGES)).events);
+
+      expect(events).toContainEqual({
+        type: 'usage',
+        usage: { promptTokens: 30, completionTokens: 5 },
+      });
+      // 不打开这个字段，厂商根本不会发上面那一帧 —— 要测就一起测。
+      expect(requests[0].body.stream_options).toEqual({ include_usage: true });
+    });
+
+    it('LLM_STREAM_USAGE=false 时不发 stream_options（少数实现不认这个字段）', async () => {
+      const { baseUrl, requests } = await startVendor((res) => {
+        openStream(res);
+        res.write(textFrame('好'));
+        res.end('data: [DONE]\n\n');
+      });
+
+      await drainEvents(
+        (await makeProvider(baseUrl, { streamUsage: false }).stream(MESSAGES)).events,
+      );
+
+      expect(requests[0].body).not.toHaveProperty('stream_options');
     });
   });
 });

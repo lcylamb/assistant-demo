@@ -47,6 +47,22 @@ export interface LlmToolSpec {
   parameters: Record<string, unknown>;
 }
 
+/**
+ * 厂商报的 token 用量。
+ *
+ * 为什么用它而不是自己按字数估：**只有厂商知道它的 tokenizer 怎么切**。
+ * 中文、代码、JSON 的切法各不相同，字数估算在成本核算上会差出成倍 ——
+ * 一个用来算钱的数字，不能建立在猜上面。
+ *
+ * 它也可能**没有**：不是所有兼容实现都报 usage，流式还得请求方显式打开
+ * （OpenAI 协议的 `stream_options.include_usage`）。所以各层类型里它都是可空的，
+ * 「没有」和「是 0」必须能分开 —— 没有的数字不能参与求和，否则成本看起来永远偏低。
+ */
+export interface LlmUsage {
+  promptTokens: number;
+  completionTokens: number;
+}
+
 export interface LlmRequestOptions {
   /**
    * 取消信号。客户端断开连接时用它把还在跑的请求掐掉，
@@ -65,6 +81,8 @@ export interface LlmCompletion {
   model: string;
   /** 这一轮模型要求调用的工具。空数组 = 它给了最终答案。 */
   toolCalls: LlmToolCall[];
+  /** 厂商报的用量。没报就是 undefined —— 别用 0 冒充「没花 token」。 */
+  usage?: LlmUsage;
 }
 
 /**
@@ -73,10 +91,15 @@ export interface LlmCompletion {
  * 文本是真的一段段到的；工具调用是**分片**到的（`index` 相同的是同一个调用，
  * name 和 arguments 各来一部分），所以 provider 会攒到流结束才发 `tool_call` 事件。
  * 这对调用方是好事：它拿到的永远是完整的调用，不用自己拼碎片。
+ *
+ * `usage` 单独成一种事件，而不是挂在 `LlmStream` 信封上：用量在**流的末尾**才到
+ * （有的厂商是最后一帧，choices 为空、只带 usage），而信封在第一个字之前就返回了。
+ * 想在信封里拿到它，就只能等整条流读完 —— 那就等于取消了流式。
  */
 export type LlmStreamEvent =
   | { type: 'text'; text: string }
-  | { type: 'tool_call'; call: LlmToolCall };
+  | { type: 'tool_call'; call: LlmToolCall }
+  | { type: 'usage'; usage: LlmUsage };
 
 /**
  * 流式响应。

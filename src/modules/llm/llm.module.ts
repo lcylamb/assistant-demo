@@ -44,6 +44,8 @@ import {
               // 默认开。要关掉是显式写 false，不是「没配就关」——
               // 对结构化输出这个项目来说，约束开着才是正常状态。
               jsonMode: config.get<string>('LLM_JSON_MODE') !== 'false',
+              // 同上：默认让厂商在流末尾报用量。少数兼容实现不认这个字段，用 false 关掉。
+              streamUsage: config.get<string>('LLM_STREAM_USAGE') !== 'false',
             });
 
           default:

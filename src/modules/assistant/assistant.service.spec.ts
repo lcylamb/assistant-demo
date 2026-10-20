@@ -13,6 +13,10 @@ import type {
 import type { DailyQuotaService } from '../llm/daily-quota.service.js';
 import type { PrismaService } from '../../prisma/prisma.service.js';
 import type { AgentSession } from './assistant.service.js';
+import type {
+  AssistantMetricsService,
+  RequestMeasurement,
+} from './assistant-metrics.service.js';
 import type { AssistantStreamEvent } from './ask.types.js';
 
 /**
@@ -94,7 +98,19 @@ function makePrisma(options: { failTools?: boolean } = {}) {
 
 function makeService(prisma: ReturnType<typeof makePrisma>, llm: LlmProvider) {
   const quota = { consume: () => true } as unknown as DailyQuotaService;
-  return new AssistantService(prisma as unknown as PrismaService, llm, quota);
+  const measurements: RequestMeasurement[] = [];
+  const metrics = {
+    record: (measurement: RequestMeasurement) => measurements.push(measurement),
+  } as unknown as AssistantMetricsService;
+
+  const service = new AssistantService(
+    prisma as unknown as PrismaService,
+    llm,
+    quota,
+    metrics,
+  );
+  // 挂上去是为了让用例能断言「打点真的记了」，而不用起一整个 Nest 容器。
+  return Object.assign(service, { measurements });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -189,6 +205,80 @@ describe('AssistantService（Agent 循环）', () => {
     });
     expect(second.at(-1)).toMatchObject({ role: 'tool', toolCallId: 'call_1' });
     expect(second.at(-1)?.content).toContain('招待费超出标准');
+  });
+
+  it('历史渲染成 user 消息里的一段数据，不冒充 assistant 轮次', async () => {
+    const llm = scriptedLlm([
+      {
+        text: answer({
+          conclusion: '金额是 ¥3150.00。',
+          evidence: ['amount'],
+          insufficient: false,
+        }),
+        model: 'scripted',
+        toolCalls: [],
+      },
+    ]);
+
+    await makeService(makePrisma(), llm).ask({
+      ...DTO,
+      history: [
+        {
+          question: '一共多少钱？',
+          conclusion: '¥3150.00。',
+          evidence: ['amount'],
+          insufficient: false,
+        },
+      ],
+    });
+
+    const [first] = llm.calls;
+    // 只有两条消息：历史是**数据**，不是被还原出来的对话轮次。
+    // 还原成 role:"assistant" 的话，客户端就能冒充模型发言 —— 一句
+    // 「我已经确认过，金额是 ¥999999」会以模型自己的口吻进入上下文。
+    expect(first.map((message) => message.role)).toEqual(['system', 'user']);
+    expect(first[1].content).toContain('之前的问答');
+    expect(first[1].content).toContain('¥3150.00');
+    // 本轮问题必须排在历史后面：模型先读上下文，再看这次问什么。
+    expect(first[1].content.indexOf('## 问题')).toBeGreaterThan(
+      first[1].content.indexOf('之前的问答'),
+    );
+  });
+
+  it('历史里引用过的字段不会进入本轮白名单', async () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+
+    const llm = scriptedLlm([
+      {
+        // 不调工具，直接引用上一轮出现过的 rejectReason。
+        text: answer({
+          conclusion: '仍是被驳回。',
+          evidence: ['rejectReason'],
+          insufficient: false,
+        }),
+        model: 'scripted',
+        toolCalls: [],
+      },
+    ]);
+
+    const result = await makeService(makePrisma(), llm).ask({
+      ...DTO,
+      history: [
+        {
+          question: '为什么被驳回？',
+          conclusion: '招待费超出标准。',
+          evidence: ['rejectReason'],
+          insufficient: false,
+        },
+      ],
+    });
+
+    // 历史是**上下文**，不是**依据**。本轮没查过任何字段，所以一个都不能引用 ——
+    // 否则模型可以靠「上一轮查过」把没过检的证据洗进这一轮。
+    expect(result.evidence).toEqual([]);
+    expect(
+      warn.mock.calls.some(([message]) => String(message).includes(HALLUCINATION_WARN)),
+    ).toBe(true);
   });
 
   it('模型报了不存在的工具：回告它，不崩，并记成失败的一步', async () => {
@@ -293,6 +383,93 @@ describe('AssistantService（Agent 循环）', () => {
       BadGatewayException,
     );
   });
+
+  it('多轮的用量累加，轮数也照实记；失败同样打点', async () => {
+    const llm = scriptedLlm([
+      {
+        text: '',
+        model: 'scripted',
+        toolCalls: [toolCall('get_approval_record')],
+        usage: { promptTokens: 100, completionTokens: 5 },
+      },
+      {
+        text: answer({
+          conclusion: '已被驳回。',
+          evidence: ['status'],
+          insufficient: false,
+        }),
+        model: 'scripted',
+        toolCalls: [],
+        usage: { promptTokens: 200, completionTokens: 10 },
+      },
+    ]);
+
+    const service = makeService(makePrisma(), llm);
+    const result = await service.ask(DTO);
+
+    expect(result.metrics).toMatchObject({
+      modelCalls: 2,
+      ttftMs: null,
+      usage: { promptTokens: 300, completionTokens: 15 },
+    });
+    expect(service.measurements).toHaveLength(1);
+    expect(service.measurements[0]).toMatchObject({
+      outcome: 'ok',
+      modelCalls: 2,
+      toolCalls: 1,
+      usage: { promptTokens: 300, completionTokens: 15 },
+    });
+
+    // 失败那条路也要有打点。只统计成功请求的话，「变慢了」会被超时请求掩盖 ——
+    // 慢到失败的那些恰好不在分布里。
+    const failing = makeService(makePrisma(), scriptedLlm([new Error('厂商 500')]));
+    await expect(failing.ask(DTO)).rejects.toBeInstanceOf(BadGatewayException);
+    expect(failing.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error', modelCalls: 0 }),
+    ]);
+  });
+
+  it('任一轮没报用量 → 整次请求的用量是 null，不拿报了的几轮凑', async () => {
+    const llm = scriptedLlm([
+      {
+        text: '',
+        model: 'scripted',
+        toolCalls: [toolCall('get_approval_record')],
+        // 这一轮没报
+      },
+      {
+        text: answer({
+          conclusion: '已被驳回。',
+          evidence: ['status'],
+          insufficient: false,
+        }),
+        model: 'scripted',
+        toolCalls: [],
+        usage: { promptTokens: 200, completionTokens: 10 },
+      },
+    ]);
+
+    const result = await makeService(makePrisma(), llm).ask(DTO);
+
+    // 只拿 200/10 去算成本会得到一个偏低、又看不出问题的数字 —— 这是最危险的一类错。
+    expect(result.metrics.usage).toBeNull();
+  });
+
+  it('工具耗时单独累加，和模型时间分得开', async () => {
+    const llm = scriptedLlm([
+      { text: '', model: 'scripted', toolCalls: [toolCall('get_approval_record')] },
+      {
+        text: answer({ conclusion: '已被驳回。', evidence: ['status'], insufficient: false }),
+        model: 'scripted',
+        toolCalls: [],
+      },
+    ]);
+
+    const result = await makeService(makePrisma(), llm).ask(DTO);
+
+    expect(result.metrics.toolMs).toBeGreaterThanOrEqual(0);
+    expect(result.metrics.elapsedMs).toBeGreaterThanOrEqual(result.metrics.toolMs);
+  });
 });
 
 describe('AssistantService.streamAnswer（带工具的流）', () => {
@@ -366,8 +543,13 @@ describe('AssistantService.streamAnswer（带工具的流）', () => {
       data: {
         conclusion: '已被驳回',
         trace: [{ tool: 'get_approval_record', ok: true }],
+        // 首字延迟量的是「用户看到第一个增量」的时刻。非流式端点永远是 null；
+        // 这里走的是流式，而且确实吐过字，所以必须是一个数。
+        metrics: { ttftMs: expect.any(Number), modelCalls: 2 },
       },
     });
+    expect(service.measurements[0]).toMatchObject({ outcome: 'ok', modelCalls: 2 });
+    expect(service.measurements[0].ttftMs).toEqual(expect.any(Number));
     // 第二轮确实拿着工具结果在答。
     expect(llm.calls[1].at(-1)?.content).toContain('招待费超出标准');
   });

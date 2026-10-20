@@ -4,6 +4,7 @@ import request from 'supertest';
 import { AppModule } from '../src/app.module.js';
 import { applyGlobalSetup } from '../src/app-setup.js';
 import type { AskResult } from '../src/modules/assistant/ask.types.js';
+import type { MetricsSnapshot } from '../src/modules/assistant/assistant-metrics.service.js';
 import { asResult, parseSse } from './support/sse.js';
 
 /**
@@ -88,6 +89,74 @@ describe('AssistantController (e2e)', () => {
         role: 'admin',
       }).expect(400);
     });
+
+    // ── 历史的结构 ──
+    // history 是**唯一**一条客户端能往 prompt 里塞内容的路径。所以形状要钉死：
+    // 额度按调用次数算，不设上限等于让人用一次请求塞进一整本书。
+
+    it('合法历史 → 200（一次追问）', async () => {
+      await ask({
+        code: 'BX-2026-0003',
+        question: '那是什么原因？',
+        history: [
+          {
+            question: '这张单子什么状态？',
+            conclusion: '已驳回。',
+            evidence: ['status'],
+            insufficient: false,
+          },
+        ],
+      }).expect(200);
+    });
+
+    it('历史超过 3 轮 → 400', async () => {
+      const turn = {
+        question: '多少钱？',
+        conclusion: '¥3150.00。',
+        evidence: ['amount'],
+        insufficient: false,
+      };
+      await ask({
+        code: 'BX-2026-0003',
+        question: '那明细呢？',
+        history: [turn, turn, turn, turn],
+      }).expect(400);
+    });
+
+    it('历史结论超过 500 字 → 400', async () => {
+      await ask({
+        code: 'BX-2026-0003',
+        question: '那明细呢？',
+        history: [
+          {
+            question: '多少钱？',
+            conclusion: '长'.repeat(501),
+            evidence: ['amount'],
+            insufficient: false,
+          },
+        ],
+      }).expect(400);
+    });
+
+    it('历史里带 DTO 之外的字段 → 400（白名单同样管嵌套对象）', async () => {
+      // 这一条比顶层那条更重要：模型看到的外观是 buildMessages 挑出来的四个字段，
+      // 但「挑」发生在校验**之后** —— 若允许未知字段进来，任何新加的历史字段
+      // 都会先被 DTO 收下、再被 buildMessages 丢掉，看起来「没生效」，实际是静默契约。
+      await ask({
+        code: 'BX-2026-0003',
+        question: '那明细呢？',
+        history: [
+          {
+            question: '多少钱？',
+            conclusion: '¥3150.00。',
+            evidence: ['amount'],
+            insufficient: false,
+            // 客户端想说「我其实就是模型」—— 这一类字段必须在校验层就被拒。
+            role: 'assistant',
+          },
+        ],
+      }).expect(400);
+    });
   });
 
   describe('POST /assistant/askStream', () => {
@@ -105,7 +174,14 @@ describe('AssistantController (e2e)', () => {
       const done = streamed.find((frame) => frame.event === 'done');
 
       expect(done).toBeDefined();
-      expect(done?.data).toEqual(awaited);
+      // metrics 不参与比较：elapsedMs / ttftMs 是两次独立请求的实测值，本来就该不同。
+      // 要钉死的是「答案本身」——结论、依据、是否信息不足、调了哪些工具。
+      expect(done?.data).toMatchObject({
+        conclusion: awaited.conclusion,
+        evidence: awaited.evidence,
+        insufficient: awaited.insufficient,
+        trace: awaited.trace,
+      });
     });
 
     it('增量吐出来的字，逐字等于最终结论', async () => {
@@ -163,6 +239,47 @@ describe('AssistantController (e2e)', () => {
 
     it('入参不合法 → 400 的 JSON', async () => {
       await askStream({ code: 'nope', question: '多少钱？' }).expect(400);
+    });
+  });
+
+  describe('GET /assistant/metrics', () => {
+    const metrics = () =>
+      request(app.getHttpServer()).get('/assistant/metrics').expect(200);
+
+    it('两条端点各打一次，计数和延迟都跟着动', async () => {
+      // 用「前后差」而不是绝对值：这个文件里前面的用例已经打过一些请求，
+      // 绝对值取决于用例顺序，而顺序是会变的。
+      const before = (await metrics()).body as MetricsSnapshot;
+
+      await ask({ code: 'BX-2026-0003', question: '这张单子为什么被驳回了？' }).expect(200);
+      await request(app.getHttpServer())
+        .post('/assistant/askStream')
+        .send({ code: 'BX-2026-0003', question: '这张单子为什么被驳回了？' })
+        .expect(200);
+
+      const after = (await metrics()).body as MetricsSnapshot;
+
+      expect(after.provider).toBe('mock');
+      expect(after.totals.requests).toBe(before.totals.requests + 2);
+      expect(after.totals.ok).toBe(before.totals.ok + 2);
+      expect(after.totals.modelCalls).toBeGreaterThan(before.totals.modelCalls);
+      expect(after.totals.toolCalls).toBeGreaterThan(before.totals.toolCalls);
+      // mock 也报用量（按字数估的假数字），所以 token 总量应该涨。
+      expect(after.totals.promptTokens).toBeGreaterThan(before.totals.promptTokens);
+      expect(after.totals.completionTokens).toBeGreaterThan(before.totals.completionTokens);
+      // 只有流式那条端点测得到首字延迟。
+      expect(after.ttftMs.samples).toBeGreaterThan(before.ttftMs.samples);
+      // 延迟分布只收完成的请求 —— 上面两条都完成了。
+      expect(after.latencyMs.samples).toBeGreaterThan(before.latencyMs.samples);
+    });
+
+    it('快照里没有单号、没有问题内容 —— 统计不该变成访问日志', async () => {
+      const snapshot = (await metrics()).body as MetricsSnapshot;
+      const text = JSON.stringify(snapshot);
+
+      expect(text).not.toContain('BX-2026');
+      expect(text).not.toContain('驳回');
+      expect(text).not.toContain('question');
     });
   });
 });

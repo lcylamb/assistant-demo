@@ -7,6 +7,7 @@ import type {
   LlmStream,
   LlmStreamEvent,
   LlmToolCall,
+  LlmUsage,
 } from './llm.types.js';
 
 /**
@@ -209,7 +210,7 @@ export class MockLlmProvider implements LlmProvider {
     messages: LlmMessage[],
     options?: LlmRequestOptions,
   ): Promise<LlmCompletion> {
-    const question = messages.filter((m) => m.role === 'user').at(-1)?.content ?? '';
+    const question = extractQuestion(messages);
     const hasToolResults = messages.some((m) => m.role === 'tool');
 
     // 第一轮：只决定查什么，不说话。真实模型在工具轮也基本是这个形状
@@ -217,7 +218,14 @@ export class MockLlmProvider implements LlmProvider {
     if (!hasToolResults && options?.tools && options.tools.length > 0) {
       const call = this.chooseTool(question, options);
       if (call) {
-        return { text: '', model: `${this.name}/rule-table`, toolCalls: [call] };
+        return {
+          text: '',
+          model: `${this.name}/rule-table`,
+          toolCalls: [call],
+          // 工具轮也有用量：厂商算的是「这些 prompt + 这段 tool_calls 输出」。
+          // 少了它，多轮的用量里会少掉整整一轮，成本看起来偏低。
+          usage: estimateUsage(messages, JSON.stringify(call)),
+        };
       }
     }
 
@@ -232,12 +240,14 @@ export class MockLlmProvider implements LlmProvider {
       : NO_DATA;
 
     const misbehaved = this.maybeMisbehave(answer);
+    const text = `\`\`\`json\n${JSON.stringify(misbehaved, null, 2)}\n\`\`\``;
 
     return {
       // 包一层代码块 —— 真实模型十次有八次这么干，解析器必须能吃下去。
-      text: `\`\`\`json\n${JSON.stringify(misbehaved, null, 2)}\n\`\`\``,
+      text,
       model: `${this.name}/rule-table`,
       toolCalls: [],
+      usage: estimateUsage(messages, text),
     };
   }
 
@@ -331,7 +341,7 @@ async function* chunkify(
   }
 }
 
-/** 文本块在前，工具调用在后 —— 和真厂商的帧顺序一致。 */
+/** 文本块在前，用量其次，工具调用在后 —— 和真厂商的帧顺序一致。 */
 async function* mockEvents(
   completion: LlmCompletion,
   signal?: AbortSignal,
@@ -339,9 +349,28 @@ async function* mockEvents(
   for await (const text of chunkify(completion.text, signal)) {
     yield { type: 'text', text };
   }
+  if (completion.usage) {
+    yield { type: 'usage', usage: completion.usage };
+  }
   for (const call of completion.toolCalls) {
     yield { type: 'tool_call', call };
   }
+}
+
+/**
+ * 按字数估一个用量。
+ *
+ * ⚠️ **这不是 tokenizer**。它存在的意义只是让「用量 → 打点 → 成本」这条管道
+ * 在没有密钥的情况下也能被测、被演示。任何拿它当成本依据的结论都是错的：
+ * 中文、JSON、代码的切法差别很大，真实数字只有厂商的 tokenizer 给得出来。
+ */
+function estimateUsage(messages: LlmMessage[], completionText: string): LlmUsage {
+  const chars = (text: string) => Math.ceil(text.length / 2);
+
+  return {
+    promptTokens: Math.max(1, chars(messages.map((m) => m.content).join(''))),
+    completionTokens: Math.max(1, chars(completionText)),
+  };
 }
 
 /**
@@ -418,6 +447,25 @@ function recordFromToolMessages(messages: LlmMessage[]): MockRecord | null {
   }
 
   return merged ? record : null;
+}
+
+/**
+ * 取本轮的问题。
+ *
+ * ⚠️ 不能拿整条 user 消息去匹配关键词。多轮之后那条消息里还带着「之前的问答」，
+ * 上一轮问过「金额」，这一轮问「那明细呢」—— 整条消息同时命中两条规则，
+ * 谁先谁后取决于规则表的顺序，而不是用户这次问了什么。
+ * 症状是「同一个问题，带上历史和不带历史，查的工具不一样」。
+ *
+ * 所以只取 `## 问题` 之后那一段。假模型做不了指代消解（它连「它」指谁都不知道），
+ * 这一点要认 —— 多轮的理解能力只有真模型才测得了，见 README。
+ */
+function extractQuestion(messages: LlmMessage[]): string {
+  const content = messages.filter((m) => m.role === 'user').at(-1)?.content ?? '';
+  const marker = '## 问题';
+  // 用 lastIndexOf：历史里的一句话也可能刚好含这几个字，而真正的分隔符永远在最后。
+  const at = content.lastIndexOf(marker);
+  return at === -1 ? content : content.slice(at + marker.length).trim();
 }
 
 /**

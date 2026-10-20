@@ -55,6 +55,14 @@ export interface OpenAiCompatibleConfig {
    * 少数 OpenAI 兼容服务不支持这个字段，所以留了开关（`LLM_JSON_MODE=false`）。
    */
   jsonMode: boolean;
+  /**
+   * 流式请求里是否让厂商在末尾额外发一帧用量
+   * （OpenAI 协议的 `stream_options.include_usage`）。
+   *
+   * 默认开：不打开的话流式端点永远拿不到 token 数，而流式恰好是页面真正在用的那条路。
+   * 少数兼容实现不认这个字段、会直接 400，所以留了开关（`LLM_STREAM_USAGE=false`）。
+   */
+  streamUsage: boolean;
 }
 
 /**
@@ -112,6 +120,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       text: message.text,
       model: message.model ?? this.config.model,
       toolCalls: message.toolCalls,
+      // 没报就是 undefined，不补 0：调用方靠它区分「用量为零」和「厂商没说」。
+      usage: message.usage,
     };
   }
 
@@ -292,6 +302,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 
         const delta = parseVendorDelta(value);
         if (delta.error) throw new Error(`厂商在流里回了错误：${delta.error}`);
+        // 用量通常在这一帧里单独到（choices 为空）。它不参与「谁先说」的判定，
+        // 所以只往上传，不影响下面的 break。
+        if (delta.usage) yield { type: 'usage', usage: delta.usage };
         // 先收工具碎片，再把文本发出去 —— 两者撞在同一帧里时**都不能丢**。
         // 早先这里对带碎片的那一帧直接 `continue`，文本会被静默吞掉：
         // 症状是答案偶尔少一句话，而流本身一切正常。
@@ -346,6 +359,12 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       max_tokens: this.config.maxTokens,
       stream,
     };
+    // 只有流式需要这个：不流式时 usage 本来就在响应体里。
+    // 打开后厂商会在 `[DONE]` 之前多发一帧，choices 为空、只带 usage ——
+    // 那一帧**不是错误**，parseVendorDelta 认它。
+    if (stream && this.config.streamUsage) {
+      body.stream_options = { include_usage: true };
+    }
     if (this.config.jsonMode) body.response_format = { type: 'json_object' };
 
     // 工具定义是**请求的一部分**，不是业务代码里的 if。模型看到的只有这三样：

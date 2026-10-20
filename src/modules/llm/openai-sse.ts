@@ -22,6 +22,15 @@ export interface VendorToolCallDelta {
   arguments?: string;
 }
 
+/**
+ * 厂商报的用量。**两个数字必须齐全才算数** —— 只报一个的实现，我们宁可当它没报，
+ * 也不要拿半份数据去算成本（那会让成本看起来比实际低，而且没有任何提示）。
+ */
+export interface VendorUsage {
+  promptTokens: number;
+  completionTokens: number;
+}
+
 /** 从一帧里解出来的东西。字段都可选：大部分帧只有其中一样。 */
 export interface VendorDelta {
   /** 厂商在这一帧里报的模型名。通常每帧都带，所以我们不必猜。 */
@@ -32,6 +41,8 @@ export interface VendorDelta {
   error?: string;
   /** 这一帧里工具调用的碎片。 */
   toolCalls?: VendorToolCallDelta[];
+  /** 这一帧里的用量。通常在流末尾单独一帧（choices 为空）里到。 */
+  usage?: VendorUsage;
 }
 
 /**
@@ -137,6 +148,11 @@ export function parseVendorDelta(payload: string): VendorDelta {
     out.error = body.error.message;
   }
 
+  // usage 在**顶层**，不在 choices[0].delta 里 —— 而且那一帧的 choices 常常是空数组。
+  // 这也是 parseVendorDelta 下面那个「choices 为空是合法」的注释存在的理由。
+  const usage = usageOf(body.usage);
+  if (usage) out.usage = usage;
+
   const choice = Array.isArray(body.choices) ? body.choices[0] : undefined;
   if (isRecord(choice) && isRecord(choice.delta)) {
     const content = choice.delta.content;
@@ -159,6 +175,7 @@ export interface VendorMessage {
   model?: string;
   text: string;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
+  usage?: VendorUsage;
 }
 
 export function parseVendorMessage(body: unknown): VendorMessage {
@@ -166,6 +183,9 @@ export function parseVendorMessage(body: unknown): VendorMessage {
   if (!isRecord(body)) return out;
 
   if (typeof body.model === 'string' && body.model !== '') out.model = body.model;
+
+  const usage = usageOf(body.usage);
+  if (usage) out.usage = usage;
 
   const choice = Array.isArray(body.choices) ? body.choices[0] : undefined;
   if (!isRecord(choice)) return out;
@@ -227,4 +247,25 @@ function toolCallDeltas(raw: unknown): VendorToolCallDelta[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+/**
+ * 解厂商的 `usage`。
+ *
+ * 数字必须是非负有限数、且**两个都在**。宁可返回 undefined 让上层记「这一轮没报」，
+ * 也不要把缺的那一半当成 0 —— 成本核算里，一个偏低的数字比一个已知的「不知道」危险得多：
+ * 前者看起来是结论，后者会逼人去查。
+ */
+function usageOf(raw: unknown): VendorUsage | undefined {
+  if (!isRecord(raw)) return undefined;
+
+  const prompt = raw.prompt_tokens;
+  const completion = raw.completion_tokens;
+  if (!isCount(prompt) || !isCount(completion)) return undefined;
+
+  return { promptTokens: prompt, completionTokens: completion };
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }

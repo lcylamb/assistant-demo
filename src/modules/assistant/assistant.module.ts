@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 import { LlmModule } from '../llm/llm.module.js';
+import { AssistantMetricsService } from './assistant-metrics.service.js';
 import { AssistantController } from './assistant.controller.js';
 import { AssistantService } from './assistant.service.js';
 
 @Module({
   imports: [LlmModule],
   controllers: [AssistantController],
-  providers: [AssistantService],
+  providers: [AssistantService, AssistantMetricsService],
 })
 export class AssistantModule {}
