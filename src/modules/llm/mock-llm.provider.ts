@@ -339,15 +339,36 @@ export class MockLlmProvider implements LlmProvider {
 /** 每块几个字。故意取小值，让 chunk 边界经常落在多字节字符和转义序列中间。 */
 const CHUNK_SIZE = 6;
 /** 块之间的间隔。太小看不出「一个字一个字出来」，太大测试变慢。 */
-const CHUNK_DELAY_MS = 25;
+const DEFAULT_CHUNK_DELAY_MS = 25;
+
+/**
+ * 每块之间停多久。
+ *
+ * 默认 25ms 是给页面看的节奏。`MOCK_CHUNK_DELAY_MS` 只在需要**一条足够长的流**
+ * 时调大：演示「首字延迟 ≪ 总耗时」，以及复现「活跃的 SSE 流拖住进程退出」——
+ * 后者没有一条长流就看不出来（默认答案几百毫秒就吐完了）。
+ *
+ * 非法值回落默认，理由和 `SSE_HEARTBEAT_MS` 一样：一个写错的环境变量
+ * 不能变成 0 延迟的忙循环。
+ */
+function chunkDelayMs(): number {
+  const raw = process.env.MOCK_CHUNK_DELAY_MS?.trim();
+  if (!raw) return DEFAULT_CHUNK_DELAY_MS;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_CHUNK_DELAY_MS;
+  return value;
+}
 
 async function* chunkify(
   text: string,
   signal?: AbortSignal,
 ): AsyncGenerator<string> {
+  const delayMs = chunkDelayMs();
+
   for (let offset = 0; offset < text.length; offset += CHUNK_SIZE) {
     if (signal?.aborted) return;
-    await delay(CHUNK_DELAY_MS, signal);
+    await delay(delayMs, signal);
     yield text.slice(offset, offset + CHUNK_SIZE);
   }
 }

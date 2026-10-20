@@ -91,10 +91,14 @@ jobs:
       # 这和 docker-compose.yml 顶部那个「同一个 DATABASE_URL 取值不一样」是同一个坑。
       - name: 起容器，打一次真实请求
         run: |
+          # MOCK_CHUNK_DELAY_MS 只影响流式端点（假模型每吐 6 个字停 1 秒）。
+          # 设它是为了让下面那条「SIGTERM 时有活跃的流」的用例真的有一条长流可等；
+          # 上面的 /assistant/ask 走非流式，完全不受影响。
           docker run -d --name app -p 3100:3100 \
             --add-host=host.docker.internal:host-gateway \
             -e 'DATABASE_URL=postgresql://demo:demo@host.docker.internal:5432/assistant_demo?schema=public' \
             -e LLM_PROVIDER=mock \
+            -e MOCK_CHUNK_DELAY_MS=1000 \
             assistant-demo:ci
 
           for i in $(seq 1 30); do
@@ -118,17 +122,40 @@ jobs:
           docker exec app sh -c 'test ! -e /app/.env'
           test "$(docker exec app id -u)" != "0"
 
-      # 「优雅退出」由两处共同保证：Dockerfile 的 CMD 用 exec 形式（不然 SIGTERM
-      # 被 shell 吃掉）、main.ts 里 enableShutdownHooks（不然钩子不跑）。
-      # 任一处写错，症状都是静默的：进程被 SIGKILL，连接池悬着，没有任何报错。
-      # 退出码和最后那行日志是唯一能看见的证据。
-      - name: SIGTERM 走完钩子再退出（不是被 SIGKILL）
+      # 「优雅退出」由三处共同保证：Dockerfile 的 CMD 用 exec 形式（不然 SIGTERM
+      # 被 shell 吃掉）、main.ts 里 enableShutdownHooks（不然钩子不跑）、
+      # APP_OPTIONS.forceCloseConnections（不然一条活跃的 SSE 会让 `server.close()`
+      # 等到流结束，等过 10 秒宽限期就被 SIGKILL —— 退出码 137）。
+      #
+      # 所以这里特意**带着一条正在写的流**去停容器。只测空闲状态是不够的：
+      # 没有第三处，空闲时照样 exit 0，问题只在真有人用的时候出现。
+      - name: SIGTERM 走完钩子再退出（有活跃的流也一样）
         run: |
+          curl -sN --max-time 30 -X POST http://127.0.0.1:3100/assistant/askStream \
+            -H 'content-type: application/json' \
+            -d '{"code":"BX-2026-0006","question":"这笔钱都花在哪些项目上？"}' \
+            > /tmp/stream.txt &
+          curl_pid=$!
+
+          # 等到真的开始出字再停 —— 否则测到的还是空闲状态。
+          # 假模型要吐几个块才轮到 conclusion 的值，慢机器上给足 15 秒。
+          for i in $(seq 1 15); do
+            grep -q 'event: delta' /tmp/stream.txt && break
+            sleep 1
+          done
+          grep -q 'event: delta' /tmp/stream.txt
+
+          started=$(date +%s)
           docker stop --time=10 app
+          elapsed=$(( $(date +%s) - started ))
+          wait "$curl_pid" || true
+
           code=$(docker inspect -f '{{.State.ExitCode}}' app)
-          echo "exit code: $code"
+          echo "exit code: $code, docker stop 用时: ${elapsed}s"
           # 137 = 128 + 9，被 SIGKILL；0 才是自己收完尾走的。
           test "$code" = "0"
+          # 有活跃流时也必须立刻退：等到 10 秒宽限期说明强断没生效。
+          test "$elapsed" -lt 5
           docker logs app 2>&1 | grep -q '收到退出信号，数据库连接已释放'
 
       - name: 启动失败时把容器日志带出来
