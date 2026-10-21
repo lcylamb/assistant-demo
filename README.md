@@ -184,7 +184,7 @@ npm run test:e2e  # end-to-end tests and evaluation, requires a database
 npm run lint      # oxlint with type-aware checks
 ```
 
-CI runs `lint` → `tsc --noEmit` → `build` → unit tests → end-to-end tests on every push and pull request. The database is provided by an Actions service container, migrated and seeded from scratch each run. The pipeline ends by building and starting the real container to verify health checks, one live request, no secrets in the image, a non-root process, and a clean `docker stop`.
+CI runs `lint` → `tsc --noEmit` → `build` → unit tests → end-to-end tests on every push to `main` and on pull requests. The database is provided by an Actions service container, migrated and seeded from scratch each run. The pipeline ends by building and starting the real container to verify health checks, one live request, no secrets in the image, a non-root process, and a clean `docker stop`.
 
 CI runs the mock only; real-model evaluation is run locally.
 
@@ -246,3 +246,7 @@ Out of scope: RAG (the data is structured, so querying the database directly is 
 All data in this repository is fictional: names are placeholders such as "Zhang San / Li Si / Wang Wu", with no real people, ID numbers, phone numbers, or data from any real business system. Amounts are invented as well.
 
 The seed inserts 10 expense reports covering draft, pending approval, approved, rejected, and paid states, used by both normal-path and edge-case evaluations.
+
+## License
+
+[MIT](LICENSE)
