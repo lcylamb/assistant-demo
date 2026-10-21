@@ -55,7 +55,7 @@ docker compose down
 
 ## 持续集成
 
-每次 push / PR 执行：
+推送到 `main` 的提交与 PR 执行：
 
 1. `lint`（oxlint，含类型检查）
 2. `tsc --noEmit`

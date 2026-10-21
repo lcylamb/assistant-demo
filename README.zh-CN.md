@@ -184,7 +184,7 @@ npm run test:e2e  # 端到端测试与评测，需要数据库
 npm run lint      # oxlint（含类型检查）
 ```
 
-CI 每次 push / PR 执行 `lint` → `tsc --noEmit` → `build` → 单元测试 → 端到端测试。数据库由 Actions service 容器提供，每次从零迁移并 seed；末尾构建并启动真实容器，验证探活、一次请求、镜像中无密钥、进程非 root、`docker stop` 正常退出。
+CI 在推送到 `main` 以及发起 PR 时执行 `lint` → `tsc --noEmit` → `build` → 单元测试 → 端到端测试。数据库由 Actions service 容器提供，每次从零迁移并 seed；末尾构建并启动真实容器，验证探活、一次请求、镜像中无密钥、进程非 root、`docker stop` 正常退出。
 
 CI 只运行 mock；真实模型评测在本地手动执行。
 
@@ -246,3 +246,7 @@ docker compose up --build   # 数据库 + 迁移 + 应用
 仓库中的所有数据均为虚构：姓名为「张三 / 李四 / 王五 / 赵六 / 孙七」等占位名，不含真实人员、证件号、手机号，也没有来自真实业务系统的数据。金额同样是编造的。
 
 seed 写入 10 张报销单，覆盖草稿、待审批、已通过、已驳回、已支付等状态，用于评测中的正常路径与陷阱用例。
+
+## 许可证
+
+[MIT](LICENSE)
