@@ -1,6 +1,6 @@
-# assistant-demo
+# expense-assistant
 
-[![CI](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml)
+[![CI](https://github.com/lcylamb/expense-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/expense-assistant/actions/workflows/ci.yml)
 
 **[中文](README.zh-CN.md)**
 
@@ -229,7 +229,7 @@ Details: [docs/operations.md](docs/operations.md) (Chinese).
 
 ## Known limitations
 
-This is a demo project, not a production system:
+This is a practice project, not a production system:
 
 - No authentication, authorization, or multi-tenant isolation.
 - Metrics, rate limits, concurrency limits, and daily quota are in-process. Multiple instances count independently, and restarts reset them.

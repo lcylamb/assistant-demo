@@ -1,5 +1,5 @@
 {
-  "name": "assistant-demo",
+  "name": "expense-assistant",
   "version": "0.0.1",
   "description": "用自然语言问一张报销单：NestJS + Prisma + PostgreSQL + LLM 结构化输出的最小可演示实现",
   "author": "",

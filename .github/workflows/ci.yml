@@ -82,7 +82,7 @@ jobs:
       # 而且分叉的地方恰恰是 npm test 碰不到的：dist 的布局、prisma client 有没有
       # 被带进镜像、USER node 的权限、.env 有没有被 COPY 进去。
       - name: 构建运行时镜像
-        run: docker build --target runtime -t assistant-demo:ci .
+        run: docker build --target runtime -t expense-assistant:ci .
 
       # 起真容器、连真库、打一次真请求。只验证「docker build 成功」是不够的 ——
       # 镜像里少一个文件，构建照样成功，容器一启动就退出。
@@ -99,7 +99,7 @@ jobs:
             -e 'DATABASE_URL=postgresql://demo:demo@host.docker.internal:5432/assistant_demo?schema=public' \
             -e LLM_PROVIDER=mock \
             -e MOCK_CHUNK_DELAY_MS=1000 \
-            assistant-demo:ci
+            expense-assistant:ci
 
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:3100/health > /dev/null; then
