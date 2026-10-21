@@ -60,6 +60,25 @@ describe('AssistantMetricsService', () => {
     expect(snapshot.provider).toBe('mock');
   });
 
+  it('被拒绝的请求按原因分开计数，且不混进 totals', () => {
+    const metrics = makeMetrics();
+    metrics.recordRejection('rateLimit');
+    metrics.recordRejection('rateLimit');
+    metrics.recordRejection('concurrency');
+    metrics.recordRejection('quota');
+
+    const snapshot = metrics.snapshot();
+
+    expect(snapshot.rejections).toEqual({
+      rateLimit: 2,
+      concurrency: 1,
+      quota: 1,
+    });
+    // 它们连 service 都没进：算进 requests 会让错误率和平均耗时一起失真。
+    expect(snapshot.totals.requests).toBe(0);
+    expect(snapshot.latencyMs.samples).toBe(0);
+  });
+
   it('成功、失败、取消分开记；取消不进延迟分布', () => {
     const metrics = makeMetrics();
     metrics.record(measurement({ outcome: 'ok', elapsedMs: 100 }));

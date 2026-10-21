@@ -6,6 +6,7 @@ import {
   type ExecutionContext,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import { AssistantMetricsService } from './assistant-metrics.service.js';
 
 /**
  * 并发上限：同一时刻最多允许多少个模型请求活着。
@@ -52,11 +53,15 @@ export function maxConcurrentAsks(): number {
 export class ModelConcurrencyGuard implements CanActivate {
   private active = 0;
 
+  constructor(private readonly metrics: AssistantMetricsService) {}
+
   canActivate(context: ExecutionContext): boolean {
     const limit = maxConcurrentAsks();
     if (limit === 0) return true;
 
     if (this.active >= limit) {
+      // 被挡下的请求不会进 `record()` —— 不单独数一笔，指标里就没有「正在被压」的迹象。
+      this.metrics.recordRejection('concurrency');
       throw new HttpException(
         '当前请求太多，请稍后再试',
         HttpStatus.TOO_MANY_REQUESTS,

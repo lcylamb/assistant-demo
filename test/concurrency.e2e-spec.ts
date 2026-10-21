@@ -3,6 +3,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Test, type TestingModule } from '@nestjs/testing';
 import { AppModule } from '../src/app.module.js';
 import { applyGlobalSetup } from '../src/app-setup.js';
+import type { MetricsSnapshot } from '../src/modules/assistant/assistant-metrics.service.js';
 import type {
   LlmCompletion,
   LlmProvider,
@@ -87,6 +88,11 @@ describe('并发上限 (e2e)', () => {
 
   const body = { code: 'BX-2026-0003', question: '这张单子为什么被驳回了？' };
 
+  const metrics = async (): Promise<MetricsSnapshot> =>
+    (
+      await fetch(`${baseUrl}/assistant/metrics`)
+    ).json() as Promise<MetricsSnapshot>;
+
   function startStream(signal?: AbortSignal): Promise<Response> {
     return fetch(`${baseUrl}/assistant/askStream`, {
       method: 'POST',
@@ -125,6 +131,7 @@ describe('并发上限 (e2e)', () => {
   }
 
   it('额度占满时，另一个端点立刻 429，而不是排队', async () => {
+    const before = await metrics();
     const base = stub.started;
     const first = new AbortController();
     const response = await startStream(first.signal);
@@ -141,6 +148,13 @@ describe('并发上限 (e2e)', () => {
     expect(rejected.status).toBe(429);
     expect(((await rejected.json()) as { message: string }).message).toContain(
       '请稍后再试',
+    );
+
+    // 这次拒绝没进 `totals`（它连 service 都没进），但必须记在拒绝账上 ——
+    // 否则并发压满的时候，指标看起来反而一片清闲。
+    const after = await metrics();
+    expect(after.rejections.concurrency).toBe(
+      before.rejections.concurrency + 1,
     );
 
     first.abort();

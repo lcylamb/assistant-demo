@@ -1,5 +1,6 @@
 import {
   BadGatewayException,
+  HttpException,
   Logger,
   RequestTimeoutException,
   ServiceUnavailableException,
@@ -20,6 +21,7 @@ import type { PrismaService } from '../../prisma/prisma.service.js';
 import type { AgentSession } from './assistant.service.js';
 import type {
   AssistantMetricsService,
+  RejectionReason,
   RequestMeasurement,
 } from './assistant-metrics.service.js';
 import type { AssistantStreamEvent } from './ask.types.js';
@@ -146,8 +148,10 @@ function makeService(
   quota: Pick<DailyQuotaService, 'consume'> = { consume: () => true },
 ) {
   const measurements: RequestMeasurement[] = [];
+  const rejections: RejectionReason[] = [];
   const metrics = {
     record: (measurement: RequestMeasurement) => measurements.push(measurement),
+    recordRejection: (reason: RejectionReason) => rejections.push(reason),
   } as unknown as AssistantMetricsService;
 
   const service = new AssistantService(
@@ -157,7 +161,7 @@ function makeService(
     metrics,
   );
   // 挂上去是为了让用例能断言「打点真的记了」，而不用起一整个 Nest 容器。
-  return Object.assign(service, { measurements });
+  return Object.assign(service, { measurements, rejections });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -853,6 +857,48 @@ describe('AssistantService（流式：开跑之前就断开）', () => {
     expect(service.measurements).toEqual([
       expect.objectContaining({ outcome: 'error' }),
     ]);
+  });
+});
+
+describe('AssistantService（日额度）', () => {
+  it('非流式：第一轮就被额度挡住 → 429，并记一次 quota 拒绝', async () => {
+    const llm = scriptedLlm([]);
+    const service = makeService(makePrisma(), llm, { consume: () => false });
+
+    const error = await service.ask(DTO).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(429);
+    expect((error as HttpException).message).toBe(
+      '今天的演示额度用完了，明天再来。',
+    );
+    // 额度挡在模型之前 —— 一次模型调用都没发生。
+    expect(llm.calls).toHaveLength(0);
+    // 这是一次**进了 service 的**请求（错误率要看得见），同时也是一次「没进门」的拒绝。
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+    expect(service.rejections).toEqual(['quota']);
+  });
+
+  it('流式：第一轮就被额度挡住 → error 帧，并记一次 quota 拒绝', async () => {
+    const llm = streamingLlm([]);
+    const service = makeService(makePrisma(), llm, { consume: () => false });
+
+    const prepared = await service.prepare(DTO);
+    const events: AssistantStreamEvent[] = [];
+    for await (const event of service.streamAnswer(prepared)) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { type: 'error', message: '今天的演示额度用完了，明天再来。' },
+    ]);
+    expect(llm.calls).toHaveLength(0);
+    expect(service.measurements).toEqual([
+      expect.objectContaining({ outcome: 'error' }),
+    ]);
+    expect(service.rejections).toEqual(['quota']);
   });
 });
 

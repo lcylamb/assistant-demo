@@ -1,5 +1,6 @@
-import { Injectable, type ExecutionContext } from '@nestjs/common';
-import { ThrottlerGuard } from '@nestjs/throttler';
+import { Inject, Injectable, type ExecutionContext } from '@nestjs/common';
+import { ThrottlerGuard, type ThrottlerLimitDetail } from '@nestjs/throttler';
+import { AssistantMetricsService } from './modules/assistant/assistant-metrics.service.js';
 
 /**
  * 按 IP 统一计数的限流守卫。
@@ -20,11 +21,33 @@ import { ThrottlerGuard } from '@nestjs/throttler';
  */
 @Injectable()
 export class IpThrottlerGuard extends ThrottlerGuard {
+  /**
+   * 用属性注入而不是构造函数。
+   *
+   * `ThrottlerGuard` 的构造函数是库的内部形状（options / storage / reflector 三个
+   * 带自定义 token 的参数）。子类为了多拿一个依赖就把它抄一遍，升级库时抄错参数的
+   * 症状是「限流悄悄不生效」—— 而这里只想在拒绝时记一笔，不该为此接管构造过程。
+   */
+  @Inject(AssistantMetricsService)
+  private readonly metrics!: AssistantMetricsService;
+
   protected generateKey(
     _context: ExecutionContext,
     suffix: string,
     name: string,
   ): string {
     return `ip-throttle-${name}-${suffix}`;
+  }
+
+  /**
+   * 被限流挡下的请求连 service 都没进，`record()` 看不到它们。
+   * 只记一笔，然后照旧交给库去抛 429。
+   */
+  protected override async throwThrottlingException(
+    context: ExecutionContext,
+    detail: ThrottlerLimitDetail,
+  ): Promise<void> {
+    this.metrics.recordRejection('rateLimit');
+    return super.throwThrottlingException(context, detail);
   }
 }

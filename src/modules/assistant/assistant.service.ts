@@ -317,7 +317,7 @@ export class AssistantService {
       if (budget.expired()) throw this.timeoutError(session);
       if (budget.callerAborted()) throw new ClientDisconnected();
 
-      this.assertQuota();
+      this.assertQuota(session);
 
       let completion;
       try {
@@ -404,6 +404,7 @@ export class AssistantService {
         // 响应头发给浏览器了，那时再抛只会把连接搞断，用户什么也看不到。
         // 所以超限的表示方式是流里的一个 error 事件 —— 前端已经会渲染它。
         if (!this.quota.consume()) {
+          if (session.modelCalls === 0) this.metrics.recordRejection('quota');
           outcome = 'error';
           yield { type: 'error', message: QUOTA_MESSAGE };
           return;
@@ -617,8 +618,11 @@ export class AssistantService {
     };
   }
 
-  private assertQuota(): void {
+  private assertQuota(session: AgentSession): void {
     if (!this.quota.consume()) {
+      // 只有**第一轮**就被额度挡住才算「没进门的请求」；跑到一半才撞上限的，
+      // 已经做过模型调用，混进 rejections 会高估外面的压力。
+      if (session.modelCalls === 0) this.metrics.recordRejection('quota');
       throw new HttpException(QUOTA_MESSAGE, HttpStatus.TOO_MANY_REQUESTS);
     }
   }

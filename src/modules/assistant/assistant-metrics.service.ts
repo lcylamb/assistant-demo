@@ -15,6 +15,10 @@ import {
  * 日志能回答单次请求，但回答不了分布：一次 3 秒的请求是常态还是尾部？
  * 成本是按调用次数算的，还是被长答案撑起来的？这些只能聚合出来看。
  *
+ * 它还得回答「有多少请求压根没进来」。被限流、并发上限、日额度挡下的请求不会走
+ * `record()`（它们连会话都没建），只看 `totals` 的话，压力越大数字反而越好看 ——
+ * 所以另记一组 `rejections`，按原因分开。
+ *
  * ── 为什么记在进程内存里 ──
  *
  * 和 `DailyQuotaService` 是同一个取舍，也同一个诚实边界：Render 免费版只有一个实例，
@@ -37,6 +41,21 @@ import {
 
 /** 一次请求的结局。取消（用户关页面）既不算成功也不算失败，单独一类。 */
 export type RequestOutcome = 'ok' | 'error' | 'aborted';
+
+/**
+ * 请求被挡在模型之外的原因。
+ *
+ *   · `rateLimit` —— 按 IP 的频率额度（守卫层，两个端点共用一份）
+ *   · `concurrency` —— 同时有太多请求在跑（守卫层）
+ *   · `quota` —— 当天的模型调用总量用完了（service 层，可能发生在第一轮或中途）
+ */
+export type RejectionReason = 'rateLimit' | 'concurrency' | 'quota';
+
+export interface Rejections {
+  rateLimit: number;
+  concurrency: number;
+  quota: number;
+}
 
 export interface RequestMeasurement {
   outcome: RequestOutcome;
@@ -84,6 +103,15 @@ export interface MetricsSnapshot {
   latencyMs: LatencySummary;
   /** 只统计确实测到了首字的流式请求。 */
   ttftMs: LatencySummary;
+  /**
+   * 没进到业务就被拒绝的次数，按挡住它的那层分开。
+   *
+   * ⚠️ 它们**不在** `totals` 里：守卫拒绝的请求连 service 都没进（没有会话、
+   * 没有耗时、没有模型调用），混进 `requests` 会让「平均耗时」和「错误率」两个
+   * 口径同时失真。反过来说，只看 `totals` 的人在服务被刷的时候会看到一片清闲 ——
+   * 这正是要单独数它们的原因。
+   */
+  rejections: Rejections;
   cost: {
     currency: string;
     /** 单价 × 已覆盖的 token。没配单价时为 null。 */
@@ -117,6 +145,12 @@ export class AssistantMetricsService {
     completionTokens: 0,
     requestsWithUsage: 0,
     requestsWithoutUsage: 0,
+  };
+
+  private readonly rejections: Rejections = {
+    rateLimit: 0,
+    concurrency: 0,
+    quota: 0,
   };
 
   constructor(
@@ -160,6 +194,16 @@ export class AssistantMetricsService {
     );
   }
 
+  /**
+   * 记一次「没进到模型就被拒绝」。
+   *
+   * 不在这里打日志：每一次拒绝在访问日志里已经有一行 429 了（带请求 id），
+   * 再加一行只是把同一个事实说两遍 —— 而且被刷的时候，日志量翻倍。
+   */
+  recordRejection(reason: RejectionReason): void {
+    this.rejections[reason] += 1;
+  }
+
   snapshot(): MetricsSnapshot {
     const t = this.totals;
     // 取消的请求不进延迟分布：它们的耗时是「用户忍了多久」，不是「服务要多久」。
@@ -191,6 +235,7 @@ export class AssistantMetricsService {
       totals: { ...t },
       latencyMs: summarize(completed.map((m) => m.elapsedMs)),
       ttftMs: summarize(ttfts),
+      rejections: { ...this.rejections },
       cost,
     };
   }

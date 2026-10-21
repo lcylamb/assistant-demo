@@ -1,6 +1,10 @@
 import { HttpException } from '@nestjs/common';
 import type { ExecutionContext } from '@nestjs/common';
 import { EventEmitter } from 'node:events';
+import type {
+  AssistantMetricsService,
+  RejectionReason,
+} from './assistant-metrics.service.js';
 import {
   ModelConcurrencyGuard,
   maxConcurrentAsks,
@@ -15,7 +19,14 @@ import {
 describe('并发上限', () => {
   const original = process.env.MAX_CONCURRENT_ASKS;
 
+  /** 被记下来的拒绝原因。守卫不直接碰这个数组，断言的是「有没有记一笔」。 */
+  const rejected: RejectionReason[] = [];
+  const metrics = {
+    recordRejection: (reason: RejectionReason) => rejected.push(reason),
+  } as unknown as AssistantMetricsService;
+
   afterEach(() => {
+    rejected.length = 0;
     if (original === undefined) delete process.env.MAX_CONCURRENT_ASKS;
     else process.env.MAX_CONCURRENT_ASKS = original;
   });
@@ -32,12 +43,14 @@ describe('并发上限', () => {
     guard.canActivate(ctx);
   }
 
-  it('超过上限直接 429，消息能直接给用户看', () => {
+  it('超过上限直接 429，消息能直接给用户看，并记一次拒绝', () => {
     process.env.MAX_CONCURRENT_ASKS = '1';
-    const guard = new ModelConcurrencyGuard();
+    const guard = new ModelConcurrencyGuard(metrics);
     const first = context();
 
     call(guard, first.ctx);
+    // 放进来的请求不记拒绝：这个计数只回答「有多少请求被挡在门外」。
+    expect(rejected).toEqual([]);
 
     let caught: unknown;
     try {
@@ -48,11 +61,13 @@ describe('并发上限', () => {
     expect(caught).toBeInstanceOf(HttpException);
     expect((caught as HttpException).getStatus()).toBe(429);
     expect((caught as HttpException).message).toContain('请稍后再试');
+    // 被拒的请求进不了 service 的 `record()`，少了这一笔，指标就看不到压力。
+    expect(rejected).toEqual(['concurrency']);
   });
 
   it('响应结束或断开都会释放额度，而且只释放一次', () => {
     process.env.MAX_CONCURRENT_ASKS = '1';
-    const guard = new ModelConcurrencyGuard();
+    const guard = new ModelConcurrencyGuard(metrics);
     const first = context();
     call(guard, first.ctx);
 
@@ -67,7 +82,7 @@ describe('并发上限', () => {
 
   it('客户端中途断开也会释放（只发 close、不发的 finish 的那种）', () => {
     process.env.MAX_CONCURRENT_ASKS = '1';
-    const guard = new ModelConcurrencyGuard();
+    const guard = new ModelConcurrencyGuard(metrics);
     const first = context();
     call(guard, first.ctx);
 
@@ -78,7 +93,7 @@ describe('并发上限', () => {
 
   it('0 表示关掉上限', () => {
     process.env.MAX_CONCURRENT_ASKS = '0';
-    const guard = new ModelConcurrencyGuard();
+    const guard = new ModelConcurrencyGuard(metrics);
 
     for (let i = 0; i < 50; i += 1) call(guard, context().ctx);
   });

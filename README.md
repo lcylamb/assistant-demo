@@ -168,8 +168,8 @@ DATABASE_URL=postgresql://demo:demo@db:5432/assistant_demo?schema=public
 **限流之外还有一道并发上限。** `MAX_CONCURRENT_ASKS`（默认 8，0 关）限制的是同一时刻有多少个模型请求活着 —— 和限流不是一回事：30 次/分 × 单次最长 90 秒，最坏情况下会堆到几十个并发，频率合规、额度没用完，但进程内存和上游连接先撑不住。它挂在**守卫**里而不是 service 里，因为必须在写任何响应头之前拒绝：被挡回来的请求（包括流式的）拿到的是一个正常的 429 JSON，而不是一条已经开了流才出现的 error 帧。额度在响应 `finish` 或 `close` 时归还，只还一次。计数同样在进程内存里，多实例要乘 N。
 
 这几条都在 `test/rate-limit.e2e-spec.ts` 里验：额度压到 3，轮着打两个端点 → 第 4 次 429；
-被拒的请求**没有**让 `metrics.requests` 涨（说明它在进入业务之前就被挡住了，没查库也没调模型）；
-两个豁免接口打满额度之后照常 200。并发上限另在 `test/concurrency.e2e-spec.ts` 里验（一个永远不说话的 provider 把请求摁在飞行中）：占满时另一个端点立刻 429、客户端断开后额度马上还回去、`0` 表示不限制。
+被拒的请求**没有**让 `metrics.requests` 涨（说明它在进入业务之前就被挡住了，没查库也没调模型），
+但 `metrics.rejections.rateLimit` 涨了两次；两个豁免接口打满额度之后照常 200。并发上限另在 `test/concurrency.e2e-spec.ts` 里验（一个永远不说话的 provider 把请求摁在飞行中）：占满时另一个端点立刻 429 并记一次 `rejections.concurrency`、客户端断开后额度马上还回去、`0` 表示不限制。
 
 ### 出问题时能对上号：`X-Request-Id`
 
@@ -581,6 +581,7 @@ M3 是真正的恶意输入：结论里没有出现 777777，真实金额答对�
   },
   "latencyMs": { "samples": 41, "p50": 1180, "p95": 3900, "max": 5120, "avg": 1442 },
   "ttftMs":    { "samples": 39, "p50": 640,  "p95": 1500, "max": 2210, "avg": 702 },
+  "rejections": { "rateLimit": 3, "concurrency": 0, "quota": 0 },
   "cost": {
     "currency": "CNY", "amount": 0.232,
     "inputPerMillion": 2, "outputPerMillion": 8,
@@ -603,6 +604,22 @@ M3 是真正的恶意输入：结论里没有出现 777777，真实金额答对�
 | `ttftMs` | 取消的也收 | 它确实出了字，这段延迟是真实发生过的 |
 | 百分位 | 最近秩（nearest-rank），不插值 | 返回的一定是**真实观测值**，不会出现一个谁都没经历过的 1234.5ms |
 | 分布窗口 | 最近 200 条 | 内存有上界；总计数另用 O(1) 累加器，不受窗口影响 |
+
+### 被挡在门外的请求也有一本账
+
+`totals` 只统计**进到 service 的**请求。被限流、并发上限、日额度挡下的请求连会话都没建，
+不在 `requests` 里 —— 只看 `totals` 的话，服务被刷的时候指标反而显得清闲。所以另记一组
+`rejections`，按挡住它的那层分开：
+
+- `rateLimit` —— 按 IP 的频率额度用完了（`IpThrottlerGuard`）
+- `concurrency` —— 同时在跑的请求到了 `MAX_CONCURRENT_ASKS`（`ModelConcurrencyGuard`）
+- `quota` —— 当天模型调用总量用完了（`DailyQuotaService`）；只有**第一轮**就被挡住才算，
+  跑到第 N 轮才撞上限的已经做过模型调用，算进来会高估「门外」的压力
+
+这两本账**不要相加**：被额度拒绝的请求确实进了 service，在 `totals` 里是一次 `error`，
+同时也会记进 `rejections.quota`；被守卫拒绝的请求则只会出现在 `rejections` 里。
+`test/rate-limit.e2e-spec.ts` 和 `test/concurrency.e2e-spec.ts` 各钉了一条：
+`totals.requests` 不动、`rejections` 相应原因 +1。
 
 ### 「没有」和「是 0」是两件事
 

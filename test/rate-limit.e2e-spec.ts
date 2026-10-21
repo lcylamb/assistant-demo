@@ -83,6 +83,8 @@ describe('限流 (e2e)', () => {
     expect(after.totals.requests).toBe(before.totals.requests + LIMIT);
     expect(after.totals.ok).toBe(before.totals.ok + LIMIT);
     expect(after.totals.errors).toBe(before.totals.errors);
+    // 被拒的两次也要看得见 —— 它们进不了 totals，只在这个账上。
+    expect(after.rejections.rateLimit).toBe(before.rejections.rateLimit + 2);
   });
 
   it('探活和指标接口豁免 —— 它们不碰模型，被挡只会伤到平台和看指标的人', async () => {
