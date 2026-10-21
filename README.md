@@ -21,7 +21,7 @@ Open <http://localhost:3100> after `npm run start:dev`. The default provider is 
 
 ## Quick start
 
-Requires Node 20+ and Docker.
+Requires Node 22.12+ and Docker.
 
 ```bash
 cp .env.example .env      # defaults to PostgreSQL on localhost:5433
@@ -130,7 +130,7 @@ At most 3 turns. History is context only; it does not expand which fields may be
 | `GET` | `/assistant/metrics` | In-process metrics snapshot |
 | `GET` | `/health` | Runs `select 1`; returns `503` when the database is unavailable |
 
-Every response carries `X-Request-Id`, and log lines are prefixed with `[req <id>]` to correlate a request.
+Every response carries `X-Request-Id`; logs are JSON lines that carry the same value as `reqId`.
 
 | Status | Meaning |
 |---|---|

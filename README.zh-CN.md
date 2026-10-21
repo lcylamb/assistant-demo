@@ -21,7 +21,7 @@
 
 ## 快速开始
 
-前置：Node 20+、Docker。
+前置：Node 22.12+、Docker。
 
 ```bash
 cp .env.example .env      # 默认连接本机 5433 上的 PostgreSQL
@@ -130,7 +130,7 @@ data: {"message":"模型调用失败，请重试"}
 | `GET` | `/assistant/metrics` | 进程内指标快照 |
 | `GET` | `/health` | 执行一次 `select 1`，数据库不可用时返回 `503` |
 
-所有响应带 `X-Request-Id`，日志中以 `[req <id>]` 关联同一次请求。
+所有响应带 `X-Request-Id`，日志为 JSON 行，其中 `reqId` 字段与响应头同值。
 
 | 状态码 | 含义 |
 |---|---|

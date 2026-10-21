@@ -2,8 +2,10 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { LoggerModule } from 'nestjs-pino';
 import { AppController } from './app.controller.js';
 import { IpThrottlerGuard } from './ip-throttler.guard.js';
+import { PINO_HTTP_OPTIONS } from './logging.js';
 import { AssistantModule } from './modules/assistant/assistant.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 
@@ -44,6 +46,17 @@ import { PrismaModule } from './prisma/prisma.module.js';
           limit: Number(config.get('RATE_LIMIT_PER_MINUTE') ?? 30),
         },
       ],
+    }),
+
+    // 日志。配置内容见 logging.ts，这里只说两件**只能在这里**说的事：
+    //
+    // 1. 整个应用只能 `forRoot` 注册一次。注册两次不会报错，但 pino-http 中间件
+    //    会被挂两遍，每个请求的访问日志和 `reqId` 都会翻倍 —— 而且一切看起来都正常。
+    // 2. 第二个参数用 `process.stdout` 而不是默认的 fd 直写（sonic-boom）：
+    //    fd 直写绕过 `process.stdout.write`，e2e 就截不到日志行，验收只能靠肉眼看。
+    //    代价是吞吐略低 —— 这个项目每秒几十行日志，无所谓。
+    LoggerModule.forRoot({
+      pinoHttp: [PINO_HTTP_OPTIONS, process.stdout],
     }),
 
     PrismaModule,

@@ -27,8 +27,7 @@ src/
 │  │  ├─ openai-compatible.provider.ts 真实厂商
 │  │  └─ llm.module.ts                 provider 工厂
 │  └─ prisma/                          连接、健康检查、故障分类
-├─ request-context.ts         请求 id 与日志上下文
-├─ access-log.ts              访问日志
+├─ logging.ts                 请求 id、访问日志、pino 配置
 └─ ip-throttler.guard.ts      按 IP 统一计数的限流守卫
 
 public/index.html             演示页
@@ -38,7 +37,7 @@ test/                         e2e 与评测
 
 一次请求的路径：
 
-1. 中间件生成或沿用请求 id，开启访问日志计时；
+1. 中间件生成或沿用请求 id，并由 pino-http 为本次请求开启日志上下文；
 2. `ValidationPipe` 按 DTO 校验并剔除多余字段；
 3. 全局限流守卫与并发守卫在进入业务之前拒绝超限请求；
 4. `prepare()` 查询单号，组装系统提示与工具定义；
@@ -176,27 +175,42 @@ DTO 固定了上限：3 轮、每轮结论 500 字、16 个依据字段、问题
 
 ## 可观测性
 
-### 请求 id
+### 日志与请求 id
 
-每个响应带 `X-Request-Id`，日志每行带 `[req <id>]` 前缀。单号是业务键，不是请求键：两人同时查询同一张单时，日志会交错；请求 id 用来区分它们。
+日志是 pino 写出的 JSON，直接进 stdout，由平台收集。请求 id 与单号是两种键：单号是业务键，两人同时查询同一张单时照样分不开；`reqId` 用来把一次请求的所有日志串起来。业务日志与访问日志共用同一条流：
+
+```json
+{"level":30,"reqId":"6f1c…","req":{"id":"6f1c…","method":"GET","url":"/assistant/metrics"},"res":{"statusCode":200},"responseTime":12,"streaming":false,"aborted":false,"msg":"GET /assistant/metrics 200 12ms"}
+```
+
+请求内的业务日志只带 `reqId`，不重复整份请求（pino-http 的 `quietReqLogger`）：
+
+```json
+{"level":40,"context":"AssistantService","reqId":"6f1c…","msg":"模型引用了不存在的字段，已剔除：[status]"}
+```
+
+每个响应带 `X-Request-Id`：
 
 - 合法的传入值（`[A-Za-z0-9._:-]{8,64}`）会被沿用，以便与网关或前端的日志对齐；
 - 不合法的值会被替换。该值会进入日志和响应头，需要防止换行注入；
-- id 通过 `AsyncLocalStorage` 传递，不进入业务函数签名，只用于日志前缀。
+- id 由中间件在任何响应（包括静态页）之前写好；pino-http 通过 `AsyncLocalStorage` 把它带给请求内的每一行日志，业务函数签名里不出现它。
 
 ### 访问日志
 
-每个请求结束记录一行：
-
-```
-[req 6f1c…] GET /assistant/metrics 200 12ms
-[req 9a2b…] POST /assistant/askStream 200 1834ms（流式）
-[req c3d4…] POST /assistant/askStream 客户端断开 812ms
-```
-
 只记录 `/assistant/*` 的成功请求，以及任意路径上的 `4xx/5xx`：探活与静态资源访问频率高、信息量低，但 404 扫描和限流拒绝需要可见。
 
-客户端断开通过 `writableFinished` 判断，而不是状态码——断开时状态码仍为 200。流式请求记录整条流的耗时，因此单独标注。
+- `4xx` 记为 `warn`，`5xx` 与抛异常的请求记为 `error`，其余为 `info`；不记的请求由 `customLogLevel` 返回 `silent`。
+- 客户端断开通过 `writableFinished` 判断，而不是状态码——断开时状态码仍为 200。结果带 `aborted: true`，消息里写「客户端断开」。
+- 流式请求带 `streaming: true`，耗时是整条流的时长。
+- 请求头不进入日志：序列化器只保留 `req.id / method / url`，避免 `Authorization`、Cookie 落盘。
+
+```
+GET /assistant/metrics 200 12ms
+POST /assistant/askStream 200 1834ms（流式）
+POST /assistant/askStream 客户端断开 812ms
+```
+
+同一次请求的归属看 `reqId` 字段，而不是消息前缀。
 
 ### 指标
 

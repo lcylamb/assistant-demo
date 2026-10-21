@@ -111,6 +111,12 @@ CI 只运行 mock。真实模型评测在本地手动执行：其输出随模型
 
 ## 环境注意事项
 
+### Node
+
+`.nvmrc` 固定开发与 CI 使用的运行时（`24.22.0`）；`package.json` 的 `engines.node` 只声明最低要求 `>=22.12.0`，这个下限来自日志栈（nestjs-pino 5.x）。Dockerfile 的 `NODE_IMAGE` 与 `.nvmrc` 保持同一小版本，CI 通过 `node-version-file` 读取 `.nvmrc` —— 三处不一致的话，会出现「CI 绿了、镜像里跑不起来」。
+
+npm 11（Node 24 自带）默认**不执行**依赖的 install 脚本。`package.json` 的 `allowScripts` 列出了确实需要执行的四个包：`@prisma/engines`、`prisma`、`esbuild`、`fsevents`。新增依赖如果带 `postinstall`，安装结束时会提示被跳过，需要 `npm install-scripts approve <pkg>` 显式放行 —— 这一步顺带成了一次供应链检查。
+
 ### Prisma 7
 
 1. `url` 不能写在 `schema.prisma` 中，连接串位于 `prisma.config.ts`；

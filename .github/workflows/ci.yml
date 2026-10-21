@@ -56,9 +56,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # 和 Dockerfile 的 NODE_IMAGE 对齐：CI 里绿了、镜像里却跑不起来，
-          # 是这类流水线最典型的一种假绿。
-          node-version: '20'
+          # 版本只写在 .nvmrc 一处，和 Dockerfile 的 NODE_IMAGE 对齐：
+          # CI 里绿了、镜像里却跑不起来，是这类流水线最典型的一种假绿。
+          node-version-file: '.nvmrc'
           cache: npm
 
       - run: npm ci

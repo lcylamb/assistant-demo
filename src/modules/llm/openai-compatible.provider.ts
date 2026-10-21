@@ -690,8 +690,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   /**
    * 最短的那个截止时间生效。
    *
-   * `AbortSignal.timeout` 需要 Node 20.3+（这个项目锁的是 20.20.2，本机和镜像一致）；
-   * `AbortSignal.any` 同理。用它们而不是自己写 `setTimeout` + `clearTimeout`，
+   * `AbortSignal.timeout` / `AbortSignal.any` 在 Node 22+ 上都有（本项目要求 >=22.12）。用它们而不是自己写 `setTimeout` + `clearTimeout`，
    * 是因为手写的那份在**正常完成时**会留一个待触发的定时器 —— 测试进程会因此不退出。
    */
   private timeoutSignal(ms: number, outer?: AbortSignal): AbortSignal {

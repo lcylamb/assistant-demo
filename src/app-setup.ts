@@ -1,8 +1,8 @@
 import { ValidationPipe, type NestApplicationOptions } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'node:path';
-import { accessLogMiddleware } from './access-log.js';
-import { RequestIdLogger, requestIdMiddleware } from './request-context.js';
+import { Logger as PinoLogger } from 'nestjs-pino';
+import { requestIdMiddleware } from './logging.js';
 
 /**
  * 建应用时传给 Nest 的选项。
@@ -11,6 +11,15 @@ import { RequestIdLogger, requestIdMiddleware } from './request-context.js';
  * 测试里手抄一遍选项，测的就只是测试自己的配置。
  */
 export const APP_OPTIONS: NestApplicationOptions = {
+  /**
+   * 启动日志先缓存，等 `applyGlobalSetup` 换上 pino 之后再一起写出去。
+   *
+   * 不加的话，建应用那几百毫秒里的日志走的是 Nest 自带的 ConsoleLogger（彩色文本），
+   * 和之后的 JSON 混在同一个 stdout 里，收集端要处理两种格式。
+   * 启动失败时 Nest 会在退出前把缓存刷出来，所以不会因为缓存丢掉错误。
+   */
+  bufferLogs: true,
+
   /**
    * 收到 SIGTERM 时**不等待**活跃连接，直接销毁 socket。
    *
@@ -38,17 +47,20 @@ export const APP_OPTIONS: NestApplicationOptions = {
  * 而这种漂移不会有任何报错提示。
  */
 export function applyGlobalSetup(app: NestExpressApplication): void {
-  // ── 请求 id ──
+  // ── 日志 ──
   //
-  // 必须是第一个中间件：从它之后打的每一行日志才带得上 id。
-  // 日志器换的是**全局**实例，所以模块里那些 `new Logger(...)` 都会经过它 ——
-  // 这也是为什么只在 setup 里换一次就够，不用每个 service 各传一个。
+  // 两类日志，两个入口：
+  //
+  // · `app.useLogger` 换掉 Nest 的全局 Logger —— 模块里那些 `new Logger(...)`
+  //   从此输出 JSON，并且因为 pino-http 开了 AsyncLocalStorage，
+  //   请求内打的每一行都自动带上 `reqId`，不用逐层传参。
+  // · pino-http 的访问日志由 AppModule 里的 LoggerModule 挂载（它只能注册一次），
+  //   这里只负责在它之前定好请求 id。
+  //
+  // 顺序不是随便排的：`useStaticAssets` 注册得比 Nest 的模块中间件早，
+  // 请求 id 若不抢在它前面，首页那个 HTML 响应就带不上 `X-Request-Id`。
   app.use(requestIdMiddleware);
-  app.useLogger(new RequestIdLogger());
-
-  // 访问日志紧跟在请求 id 之后：它靠 `currentRequestId()` 取 id，
-  // 排在前面就永远拿不到。
-  app.use(accessLogMiddleware);
+  app.useLogger(app.get(PinoLogger));
 
   app.useGlobalPipes(
     new ValidationPipe({
