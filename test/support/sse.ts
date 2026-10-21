@@ -10,6 +10,9 @@ import type { AskResult } from '../../src/modules/assistant/ask.types.js';
  *
  * 所以测试侧只留这一份，谁需要谁 import —— 三份拷贝里改一份，
  * 是这类代码最容易出的错。
+ *
+ * 注释帧（`: ping`，心跳）没有 `data:`：按规范跳过，`parseSse` 只回有内容的帧。
+ * 要断言心跳确实发了，用 `countHeartbeats()`。
  */
 export interface SseFrame {
   event: string;
@@ -30,11 +33,23 @@ export function parseSse(body: string): SseFrame[] {
         else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
       }
 
+      // 注释帧。不跳过的话 `JSON.parse('')` 会抛，而错误位置离真正的原因很远。
+      if (dataLines.length === 0) return null;
+
       return {
         event,
         data: JSON.parse(dataLines.join('\n')) as Record<string, unknown>,
       };
-    });
+    })
+    .filter((frame): frame is SseFrame => frame !== null);
+}
+
+/** 数注释帧。心跳是服务端**主动**发的，没有它，长时间空闲的连接会被代理掐掉。 */
+export function countHeartbeats(body: string): number {
+  return body
+    .split('\n\n')
+    .map((frame) => frame.trim())
+    .filter((frame) => frame.startsWith(':')).length;
 }
 
 /**

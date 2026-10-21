@@ -1,6 +1,43 @@
-import { ValidationPipe } from '@nestjs/common';
+import { ValidationPipe, type NestApplicationOptions } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'node:path';
+import { Logger as PinoLogger } from 'nestjs-pino';
+import { requestIdMiddleware } from './logging.js';
+
+/**
+ * 建应用时传给 Nest 的选项。
+ *
+ * 抽出来是为了让 `main.ts` 和优雅退出那条 e2e 用的是**同一份** ——
+ * 测试里手抄一遍选项，测的就只是测试自己的配置。
+ */
+export const APP_OPTIONS: NestApplicationOptions = {
+  /**
+   * 启动日志先缓存，等 `applyGlobalSetup` 换上 pino 之后再一起写出去。
+   *
+   * 不加的话，建应用那几百毫秒里的日志走的是 Nest 自带的 ConsoleLogger（彩色文本），
+   * 和之后的 JSON 混在同一个 stdout 里，收集端要处理两种格式。
+   * 启动失败时 Nest 会在退出前把缓存刷出来，所以不会因为缓存丢掉错误。
+   */
+  bufferLogs: true,
+
+  /**
+   * 收到 SIGTERM 时**不等待**活跃连接，直接销毁 socket。
+   *
+   * 默认行为是 `server.close()` 等所有活跃请求结束。普通接口几百毫秒，等得起；
+   * SSE 不是 —— 它可能正跑着一次最长 4 轮的模型调用（每轮超时 30 秒）。
+   * 平台不会等这么久：Docker 给 10 秒宽限期，到点 SIGKILL（退出码 137）。
+   * 也就是说，默认行为恰好在**最需要优雅退出的那种场景**里失效。
+   *
+   * 实测（一条 10 秒的慢流，1.5 秒时发 SIGTERM）：默认行为下进程要等流跑完；
+   * 打开这个选项后毫秒级退出，`收到退出信号，数据库连接已释放` 那行照样出现 ——
+   * Nest 的执行顺序是先跑销毁钩子（`$disconnect`），再关 HTTP server。
+   *
+   * 代价写清楚：**在途的普通请求也会被切断**。这个项目认这个代价 —— 请求都很短，
+   * 用户刷新重试就行。要在生产里做得更细，得「先停止接受新连接 → 给在途请求
+   * 一个限时窗口 → 到点再强断」，那是另一层复杂度，不是一行选项。
+   */
+  forceCloseConnections: true,
+};
 
 /**
  * 全局配置。
@@ -10,6 +47,21 @@ import { join } from 'node:path';
  * 而这种漂移不会有任何报错提示。
  */
 export function applyGlobalSetup(app: NestExpressApplication): void {
+  // ── 日志 ──
+  //
+  // 两类日志，两个入口：
+  //
+  // · `app.useLogger` 换掉 Nest 的全局 Logger —— 模块里那些 `new Logger(...)`
+  //   从此输出 JSON，并且因为 pino-http 开了 AsyncLocalStorage，
+  //   请求内打的每一行都自动带上 `reqId`，不用逐层传参。
+  // · pino-http 的访问日志由 AppModule 里的 LoggerModule 挂载（它只能注册一次），
+  //   这里只负责在它之前定好请求 id。
+  //
+  // 顺序不是随便排的：`useStaticAssets` 注册得比 Nest 的模块中间件早，
+  // 请求 id 若不抢在它前面，首页那个 HTML 响应就带不上 `X-Request-Id`。
+  app.use(requestIdMiddleware);
+  app.useLogger(app.get(PinoLogger));
+
   app.useGlobalPipes(
     new ValidationPipe({
       // DTO 用 class 而不是 interface，就是为了让这里在运行时有东西可校验。

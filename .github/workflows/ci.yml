@@ -1,0 +1,163 @@
+name: CI
+
+# 每次 push 和 PR 跑同一套：静态检查 → 构建 → 单测 → e2e（含 23 条评测）。
+#
+# ⚠️ 这里**只用 mock**，不配任何密钥。理由不是省钱，是可复现：
+# 真模型的输出会变，把它放进 CI，红了要先判断「代码坏了」还是「模型今天手气不好」。
+# 真模型那一轮（`npm run eval:real`）留在本地手动跑 ——
+# CI 回答「管道还通不通」，真模型回答「答得准不准」，两件事不该混在一个红灯里。
+#
+# 数据库用 Actions 的 service 容器，每次从零迁移 + seed：
+# 评测里有一半断言的期望值是**从这 10 条数据算出来**的（金额、驳回原因、明细条数），
+# 所以不能复用任何共享库，也不能依赖上一个人留下的状态。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 推一版改一版时，前一次的结果已经没有意义了 —— 直接取消，省的是排队时间。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: demo
+          POSTGRES_PASSWORD: demo
+          POSTGRES_DB: assistant_demo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U demo -d assistant_demo"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --health-start-period 10s
+
+    env:
+      # 只在这个 job 里存在，和本机 .env、和部署平台都没有关系。
+      # 用户名密码是 service 容器自己的，用完即弃。
+      DATABASE_URL: postgresql://demo:demo@localhost:5432/assistant_demo?schema=public
+      LLM_PROVIDER: mock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 版本只写在 .nvmrc 一处，和 Dockerfile 的 NODE_IMAGE 对齐：
+          # CI 里绿了、镜像里却跑不起来，是这类流水线最典型的一种假绿。
+          node-version-file: '.nvmrc'
+          cache: npm
+
+      - run: npm ci
+
+      # migrate deploy 而不是 migrate dev：dev 会检查 drift、可能停下来等人确认，
+      # 而 CI 里没有人和它对话。deploy 只按 migrations 目录里已有的文件执行。
+      - run: npx prisma migrate deploy
+
+      # seed 是评测的夹具，不是「顺手造点数」。23 条用例里有相当一部分的期望值
+      # 是从这些数据算出来的 —— 手工点开的那个库和 CI 这个库必须是同一份。
+      - run: npx prisma db seed
+
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:e2e
+
+      # ── 镜像 ──
+      # 上面验的是**源码**，这一段验的是 **Dockerfile 的产物**。两者会分叉，
+      # 而且分叉的地方恰恰是 npm test 碰不到的：dist 的布局、prisma client 有没有
+      # 被带进镜像、USER node 的权限、.env 有没有被 COPY 进去。
+      - name: 构建运行时镜像
+        run: docker build --target runtime -t assistant-demo:ci .
+
+      # 起真容器、连真库、打一次真请求。只验证「docker build 成功」是不够的 ——
+      # 镜像里少一个文件，构建照样成功，容器一启动就退出。
+      #
+      # 库地址用 host.docker.internal 而不是 localhost：容器里的 localhost 是它自己。
+      # 这和 docker-compose.yml 顶部那个「同一个 DATABASE_URL 取值不一样」是同一个坑。
+      - name: 起容器，打一次真实请求
+        run: |
+          # MOCK_CHUNK_DELAY_MS 只影响流式端点（假模型每吐 6 个字停 1 秒）。
+          # 设它是为了让下面那条「SIGTERM 时有活跃的流」的用例真的有一条长流可等；
+          # 上面的 /assistant/ask 走非流式，完全不受影响。
+          docker run -d --name app -p 3100:3100 \
+            --add-host=host.docker.internal:host-gateway \
+            -e 'DATABASE_URL=postgresql://demo:demo@host.docker.internal:5432/assistant_demo?schema=public' \
+            -e LLM_PROVIDER=mock \
+            -e MOCK_CHUNK_DELAY_MS=1000 \
+            assistant-demo:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3100/health > /dev/null; then
+              echo "health ok（${i}s）"
+              break
+            fi
+            sleep 1
+          done
+
+          body=$(curl -fsS -X POST http://127.0.0.1:3100/assistant/ask \
+            -H 'content-type: application/json' \
+            -d '{"code":"BX-2026-0003","question":"这张单子为什么被驳回了？"}')
+          echo "$body"
+          echo "$body" | grep -qE '"insufficient": *false'
+
+      # 两条都是「构建成功但做的事不对」的典型：密钥被 COPY 进镜像，
+      # 或者忘了 USER node、整个服务以 root 在跑。它们不会让任何断言变红。
+      - name: 镜像里没有 .env，进程不是 root
+        run: |
+          docker exec app sh -c 'test ! -e /app/.env'
+          test "$(docker exec app id -u)" != "0"
+
+      # 「优雅退出」由三处共同保证：Dockerfile 的 CMD 用 exec 形式（不然 SIGTERM
+      # 被 shell 吃掉）、main.ts 里 enableShutdownHooks（不然钩子不跑）、
+      # APP_OPTIONS.forceCloseConnections（不然一条活跃的 SSE 会让 `server.close()`
+      # 等到流结束，等过 10 秒宽限期就被 SIGKILL —— 退出码 137）。
+      #
+      # 所以这里特意**带着一条正在写的流**去停容器。只测空闲状态是不够的：
+      # 没有第三处，空闲时照样 exit 0，问题只在真有人用的时候出现。
+      - name: SIGTERM 走完钩子再退出（有活跃的流也一样）
+        run: |
+          curl -sN --max-time 30 -X POST http://127.0.0.1:3100/assistant/askStream \
+            -H 'content-type: application/json' \
+            -d '{"code":"BX-2026-0006","question":"这笔钱都花在哪些项目上？"}' \
+            > /tmp/stream.txt &
+          curl_pid=$!
+
+          # 等到真的开始出字再停 —— 否则测到的还是空闲状态。
+          # 假模型要吐几个块才轮到 conclusion 的值，慢机器上给足 15 秒。
+          for i in $(seq 1 15); do
+            grep -q 'event: delta' /tmp/stream.txt && break
+            sleep 1
+          done
+          grep -q 'event: delta' /tmp/stream.txt
+
+          started=$(date +%s)
+          docker stop --time=10 app
+          elapsed=$(( $(date +%s) - started ))
+          wait "$curl_pid" || true
+
+          code=$(docker inspect -f '{{.State.ExitCode}}' app)
+          echo "exit code: $code, docker stop 用时: ${elapsed}s"
+          # 137 = 128 + 9，被 SIGKILL；0 才是自己收完尾走的。
+          test "$code" = "0"
+          # 有活跃流时也必须立刻退：等到 10 秒宽限期说明强断没生效。
+          test "$elapsed" -lt 5
+          docker logs app 2>&1 | grep -q '收到退出信号，数据库连接已释放'
+
+      - name: 启动失败时把容器日志带出来
+        if: failure()
+        run: docker logs app || true

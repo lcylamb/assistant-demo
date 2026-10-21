@@ -5,6 +5,9 @@ import type {
   LlmProvider,
   LlmRequestOptions,
   LlmStream,
+  LlmStreamEvent,
+  LlmToolCall,
+  LlmUsage,
 } from './llm.types.js';
 
 /**
@@ -17,8 +20,15 @@ import type {
  * 是「取数 → 组 prompt → 调用 → 解析 → 校验字段」这条链路。用假模型，链路的每一步
  * 都能写断言；换成真模型，只有最终答案能写断言。
  *
- * 它也**不能**证明「模型答得准」—— 那要靠评测集，而且必须在真模型上跑。
- * 这两件事别混为一谈。
+ * ── 接上工具调用之后，它多了一个角色 ──
+ *
+ * 它要模拟的不只是「怎么答」，还有「**先查什么**」：第一轮只回一个 tool_call，
+ * 第二轮拿着工具结果才给答案。这正好把 Agent 循环里最容易写错的几步
+ * （assistant 带 tool_calls 回传、tool 消息按 id 配对、第二轮上下文完整）
+ * 变成可断言的：走不通就答不出话，而不是"看起来答得挺好"。
+ *
+ * 它仍然**不能**证明「模型选对了工具」—— 那是评测在真模型上才能回答的问题。
+ * 这里能证明的只有「选定工具之后，这条路径是通的」。
  *
  * 故意保留的两处「不老实」，因为真实模型天天这么干，管道必须扛得住：
  *   1. 把 JSON 包在 ```json 代码块里（真实模型极爱这么写）
@@ -111,6 +121,16 @@ const RULES: Array<{ match: RegExp; answer: (record: MockRecord) => MockAnswer }
           },
   },
   {
+    match: /申请人|谁提交|谁报的|哪个部门|什么部门|部门是/,
+    // 放在「提交」前面：问「是谁提交的」也含「提交」两个字，
+    // 先命中这条才不会只剩一个提交时间。
+    answer: (record) => ({
+      conclusion: `${record.code} 由${record.applicant}提交，所属部门：${record.department}。`,
+      evidence: ['code', 'applicant', 'department'],
+      insufficient: false,
+    }),
+  },
+  {
     match: /明细|构成|花在|什么费用|哪些费用|项目/,
     answer: (record) => {
       const items = record.items ?? [];
@@ -171,16 +191,59 @@ const RULES: Array<{ match: RegExp; answer: (record: MockRecord) => MockAnswer }
   },
 ];
 
+/**
+ * 「该先查哪个工具」。
+ *
+ * ⚠️ 顺序必须和 `RULES` 逐条对齐。两处顺序一旦走岔，会出现一种很难查的错位：
+ * 选工具的那条规则说「查明细」，作答的那条规则说「答金额」—— 于是模型规规矩矩查了数据，
+ * 却引用了一个这次根本没返回的字段，最后被防幻觉逻辑剔掉，看起来像模型在瞎编。
+ *
+ * 这张表的每一行都对应 `RULES` 里同位置那条规则的 `evidence`：
+ * 选了哪个工具，就必须恰好够那条规则引用。
+ */
+const TOOL_RULES: Array<{ match: RegExp; tool: string }> = [
+  { match: /驳回|拒绝|不通过|没通过/, tool: 'get_approval_record' },
+  { match: /申请人|谁提交|谁报的|哪个部门|什么部门|部门是/, tool: 'get_expense_summary' },
+  { match: /明细|构成|花在|什么费用|哪些费用|项目/, tool: 'list_expense_items' },
+  { match: /多少钱|金额|总额|合计|花了多少/, tool: 'get_expense_summary' },
+  { match: /审批|审批意见|批准|决定|决策|通过了吗/, tool: 'get_approval_record' },
+  { match: /提交|什么时候提|时间|日期/, tool: 'get_expense_summary' },
+];
+
+/** 没命中任何规则时查表头 —— 兜底规则 `summarize` 引用的正是这些字段。 */
+const DEFAULT_TOOL = 'get_expense_summary';
+
 export class MockLlmProvider implements LlmProvider {
   readonly name = 'mock';
   private readonly logger = new Logger(MockLlmProvider.name);
 
   async complete(
     messages: LlmMessage[],
-    _options?: LlmRequestOptions,
+    options?: LlmRequestOptions,
   ): Promise<LlmCompletion> {
-    const record = extractRecord(messages);
-    const question = messages.filter((m) => m.role === 'user').at(-1)?.content ?? '';
+    const question = extractQuestion(messages);
+    const hasToolResults = messages.some((m) => m.role === 'tool');
+
+    // 第一轮：只决定查什么，不说话。真实模型在工具轮也基本是这个形状
+    //（`response_format: json_object` 会把它压得更干净，见 openai-compatible.provider.ts）。
+    if (!hasToolResults && options?.tools && options.tools.length > 0) {
+      const call = this.chooseTool(question, options);
+      if (call) {
+        return {
+          text: '',
+          model: `${this.name}/rule-table`,
+          toolCalls: [call],
+          // 工具轮也有用量：厂商算的是「这些 prompt + 这段 tool_calls 输出」。
+          // 少了它，多轮的用量里会少掉整整一轮，成本看起来偏低。
+          usage: estimateUsage(messages, JSON.stringify(call)),
+        };
+      }
+    }
+
+    // 第二轮：数据来自工具返回，不再从 prompt 里抠 —— 那正是这一版和上一版的区别。
+    const record = hasToolResults
+      ? recordFromToolMessages(messages)
+      : extractRecord(messages);
 
     const answer = record
       ? (RULES.find((rule) => rule.match.test(question))?.answer(record) ??
@@ -188,11 +251,14 @@ export class MockLlmProvider implements LlmProvider {
       : NO_DATA;
 
     const misbehaved = this.maybeMisbehave(answer);
+    const text = `\`\`\`json\n${JSON.stringify(misbehaved, null, 2)}\n\`\`\``;
 
     return {
       // 包一层代码块 —— 真实模型十次有八次这么干，解析器必须能吃下去。
-      text: `\`\`\`json\n${JSON.stringify(misbehaved, null, 2)}\n\`\`\``,
+      text,
       model: `${this.name}/rule-table`,
+      toolCalls: [],
+      usage: estimateUsage(messages, text),
     };
   }
 
@@ -209,6 +275,9 @@ export class MockLlmProvider implements LlmProvider {
    * 换成真厂商后，这些代码一行都不用改 —— 只有首字延迟会从 0 变成真实值。
    *
    * 别把「流式管道能用」说成「我做过流式优化」：后者得先有真实的首字延迟数字。
+   *
+   * 工具调用**在文本之后**发：和真厂商一样，`finish_reason` 是在流末才给结论的，
+   * 碎片在此之前攒着（见 openai-compatible.provider.ts 的 ToolCallAccumulator）。
    */
   async stream(
     messages: LlmMessage[],
@@ -219,7 +288,34 @@ export class MockLlmProvider implements LlmProvider {
 
     return {
       model: completion.model,
-      chunks: chunkify(completion.text, options?.signal),
+      events: mockEvents(completion, options?.signal),
+    };
+  }
+
+  /**
+   * 按问题挑一个工具。
+   *
+   * 只在**这次真的提供给模型的工具**里挑：如果哪天上层只挂了一个工具，
+   * 假模型不能凭空回一个没挂的工具名 —— 那会把「工具没挂上」这个配置错误
+   * 伪装成「模型选错工具」，而这两件事的排查方向完全不同。
+   */
+  private chooseTool(question: string, options: LlmRequestOptions): LlmToolCall | null {
+    const offered = new Set((options.tools ?? []).map((tool) => tool.name));
+    const named =
+      TOOL_RULES.find((rule) => rule.match.test(question))?.tool ?? DEFAULT_TOOL;
+
+    const name = offered.has(named)
+      ? named
+      : (options.tools ?? [])[0]?.name;
+    if (!name) return null;
+
+    return {
+      // 真实的 id 由厂商生成。这里固定一个，是为了让「第二轮按 id 配对」这条路径
+      // 在 mock 下也可复现 —— 随机 id 会让快照式的断言变成玄学。
+      id: 'mock_call_1',
+      name,
+      // 三个工具都没有参数：查询范围由服务端绑定（见 tools.ts 顶部那段）。
+      arguments: '{}',
     };
   }
 
@@ -228,6 +324,9 @@ export class MockLlmProvider implements LlmProvider {
    *
    * 默认关闭 —— 开着的话测试就不稳定了。要验证拦截逻辑时：
    *   MOCK_MISBEHAVE=unknown-field
+   *
+   * 讽刺的是，接上工具之后它更接近真实情况了：`approverSignature` 连工具都不返回，
+   * 所以它必定不在本次的可引用字段里 —— 这正是防幻觉要拦的那种「没查就敢引用」。
    */
   private maybeMisbehave(answer: MockAnswer): MockAnswer {
     if (process.env.MOCK_MISBEHAVE !== 'unknown-field') return answer;
@@ -240,17 +339,70 @@ export class MockLlmProvider implements LlmProvider {
 /** 每块几个字。故意取小值，让 chunk 边界经常落在多字节字符和转义序列中间。 */
 const CHUNK_SIZE = 6;
 /** 块之间的间隔。太小看不出「一个字一个字出来」，太大测试变慢。 */
-const CHUNK_DELAY_MS = 25;
+const DEFAULT_CHUNK_DELAY_MS = 25;
+
+/**
+ * 每块之间停多久。
+ *
+ * 默认 25ms 是给页面看的节奏。`MOCK_CHUNK_DELAY_MS` 只在需要**一条足够长的流**
+ * 时调大：演示「首字延迟 ≪ 总耗时」，以及复现「活跃的 SSE 流拖住进程退出」——
+ * 后者没有一条长流就看不出来（默认答案几百毫秒就吐完了）。
+ *
+ * 非法值回落默认，理由和 `SSE_HEARTBEAT_MS` 一样：一个写错的环境变量
+ * 不能变成 0 延迟的忙循环。
+ */
+function chunkDelayMs(): number {
+  const raw = process.env.MOCK_CHUNK_DELAY_MS?.trim();
+  if (!raw) return DEFAULT_CHUNK_DELAY_MS;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return DEFAULT_CHUNK_DELAY_MS;
+  return value;
+}
 
 async function* chunkify(
   text: string,
   signal?: AbortSignal,
 ): AsyncGenerator<string> {
+  const delayMs = chunkDelayMs();
+
   for (let offset = 0; offset < text.length; offset += CHUNK_SIZE) {
     if (signal?.aborted) return;
-    await delay(CHUNK_DELAY_MS, signal);
+    await delay(delayMs, signal);
     yield text.slice(offset, offset + CHUNK_SIZE);
   }
+}
+
+/** 文本块在前，用量其次，工具调用在后 —— 和真厂商的帧顺序一致。 */
+async function* mockEvents(
+  completion: LlmCompletion,
+  signal?: AbortSignal,
+): AsyncGenerator<LlmStreamEvent> {
+  for await (const text of chunkify(completion.text, signal)) {
+    yield { type: 'text', text };
+  }
+  if (completion.usage) {
+    yield { type: 'usage', usage: completion.usage };
+  }
+  for (const call of completion.toolCalls) {
+    yield { type: 'tool_call', call };
+  }
+}
+
+/**
+ * 按字数估一个用量。
+ *
+ * ⚠️ **这不是 tokenizer**。它存在的意义只是让「用量 → 打点 → 成本」这条管道
+ * 在没有密钥的情况下也能被测、被演示。任何拿它当成本依据的结论都是错的：
+ * 中文、JSON、代码的切法差别很大，真实数字只有厂商的 tokenizer 给得出来。
+ */
+function estimateUsage(messages: LlmMessage[], completionText: string): LlmUsage {
+  const chars = (text: string) => Math.ceil(text.length / 2);
+
+  return {
+    promptTokens: Math.max(1, chars(messages.map((m) => m.content).join(''))),
+    completionTokens: Math.max(1, chars(completionText)),
+  };
 }
 
 /**
@@ -285,11 +437,76 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
+ * 把工具返回的几段 JSON 拼回一张「报销单」。
+ *
+ * 这模拟的是真实模型在做的事：它看到的不是一整页数据，而是几个工具各回了一块，
+ * 回答时要在脑子里把 `code` / `amount` 这些重复出现的字段对上号。
+ *
+ * ⚠️ 跳过 `{ error }` 的返回：那是工具在说「没有这条数据」，不是数据本身。
+ * 把它并进 record 会让假模型拿着一句错误提示当字段用。
+ */
+function recordFromToolMessages(messages: LlmMessage[]): MockRecord | null {
+  const record: MockRecord = {};
+  let merged = false;
+
+  for (const message of messages) {
+    if (message.role !== 'tool') continue;
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(message.content);
+    } catch {
+      continue;
+    }
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      continue;
+    }
+    if ('error' in (payload as Record<string, unknown>)) continue;
+
+    const source = payload as MockRecord;
+    if (source.code !== undefined) record.code = source.code;
+    if (source.title !== undefined) record.title = source.title;
+    if (source.applicant !== undefined) record.applicant = source.applicant;
+    if (source.department !== undefined) record.department = source.department;
+    if (source.category !== undefined) record.category = source.category;
+    if (source.amount !== undefined) record.amount = source.amount;
+    if (source.status !== undefined) record.status = source.status;
+    if (source.submittedAt !== undefined) record.submittedAt = source.submittedAt;
+    if (source.decidedAt !== undefined) record.decidedAt = source.decidedAt;
+    if (source.rejectReason !== undefined) record.rejectReason = source.rejectReason;
+    if (Array.isArray(source.items)) record.items = source.items;
+    merged = true;
+  }
+
+  return merged ? record : null;
+}
+
+/**
+ * 取本轮的问题。
+ *
+ * ⚠️ 不能拿整条 user 消息去匹配关键词。多轮之后那条消息里还带着「之前的问答」，
+ * 上一轮问过「金额」，这一轮问「那明细呢」—— 整条消息同时命中两条规则，
+ * 谁先谁后取决于规则表的顺序，而不是用户这次问了什么。
+ * 症状是「同一个问题，带上历史和不带历史，查的工具不一样」。
+ *
+ * 所以只取 `## 问题` 之后那一段。假模型做不了指代消解（它连「它」指谁都不知道），
+ * 这一点要认 —— 多轮的理解能力只有真模型才测得了，见 README。
+ */
+function extractQuestion(messages: LlmMessage[]): string {
+  const content = messages.filter((m) => m.role === 'user').at(-1)?.content ?? '';
+  const marker = '## 问题';
+  // 用 lastIndexOf：历史里的一句话也可能刚好含这几个字，而真正的分隔符永远在最后。
+  const at = content.lastIndexOf(marker);
+  return at === -1 ? content : content.slice(at + marker.length).trim();
+}
+
+/**
  * 从 prompt 里把报销单数据抠出来。
  *
- * 之所以要「抠」而不是「传」：`LlmProvider` 的入参只有 messages —— 这是和真实厂商
- * 唯一的共同语言。假模型不能给自己开一条只有它有的旁路，否则换真模型时管道就断了。
- * 代价是这个正则很脆，但脆的是假模型，不是产品代码。
+ * ⚠️ 这条路径**新版本已经不用了**（数据改由工具返回），保留它是因为
+ * `LlmProvider` 的入参只有 messages —— 假模型不能给自己开一条只有它有的旁路。
+ * 哪天有别的调用方仍然把数据写进 prompt，这个解析还能用；用不上时它返回 null，
+ * 假模型就老老实实答 NO_DATA，而不是假装自己知道。
  */
 function extractRecord(messages: LlmMessage[]): MockRecord | null {
   const prompt = messages.map((m) => m.content).join('\n');

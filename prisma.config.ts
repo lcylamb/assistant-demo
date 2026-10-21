@@ -31,8 +31,8 @@ export default defineConfig({
   migrations: {
     path: 'prisma/migrations',
     // 注册之后 `prisma db seed` 和 `prisma migrate reset` 会自动跑它。
-    // 用 tsx 而不是 `node --experimental-strip-types`：后者要 Node 22.6+，
-    // 本机是 Node 20，那个 flag 还不存在。
+    // 用 tsx 而不是 Node 自带的类型剥离：后者只做类型剥离，ESM 解析和生成代码的
+    // 导入仍要额外配置，不同小版本之间的 flag 也变过。tsx 不依赖运行时版本。
     seed: 'tsx prisma/seed.ts',
   },
 });

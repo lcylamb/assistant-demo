@@ -4,13 +4,63 @@
  * 业务代码只认 `LlmProvider` 这个接口，不认任何具体厂商 —— 换厂商时改的是
  * `LlmModule` 里的一行绑定，不是 AssistantService。这条缝现在就要留出来，
  * 因为「先 mock 跑通、再换真模型」是这个项目的全部意义。
+ *
+ * ── 工具调用为什么长在这个接口上 ──
+ *
+ * 模型「要不要查、查什么」是模型自己的决定，所以这个决定必须发生在**模型协议层**，
+ * 而不是业务代码里写一串 if。`tools` 进请求、`toolCalls` 进响应，就是协议层的全部形状。
+ * 工具**怎么执行**与这里无关 —— 那是 AssistantService 的事，它拿到的是
+ * 「模型想要什么」，不是「厂商的 JSON 长什么样」。
  */
 
-export type LlmRole = 'system' | 'user' | 'assistant';
+export type LlmRole = 'system' | 'user' | 'assistant' | 'tool';
+
+/**
+ * 模型要求的一次工具调用。
+ *
+ * `arguments` 保持**厂商原样的 JSON 字符串**，不在这里解析。理由和 provider 不解析答案一样：
+ * 参数可能是坏的，而「坏参数」属于工具执行层该处理并**回告模型**的事，
+ * 不是协议层该崩掉的事。
+ */
+export interface LlmToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
 
 export interface LlmMessage {
   role: LlmRole;
   content: string;
+  /**
+   * role=assistant 且这一轮要求调用工具时，带上模型要的所有调用。
+   * 回传给厂商时必须原样带上，否则它会看不到自己上一轮说了什么。
+   */
+  toolCalls?: LlmToolCall[];
+  /** role=tool 时，这条结果对应哪一个调用。 */
+  toolCallId?: string;
+}
+
+/** 给模型看的工具说明。`parameters` 是 JSON Schema。 */
+export interface LlmToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * 厂商报的 token 用量。
+ *
+ * 为什么用它而不是自己按字数估：**只有厂商知道它的 tokenizer 怎么切**。
+ * 中文、代码、JSON 的切法各不相同，字数估算在成本核算上会差出成倍 ——
+ * 一个用来算钱的数字，不能建立在猜上面。
+ *
+ * 它也可能**没有**：不是所有兼容实现都报 usage，流式还得请求方显式打开
+ * （OpenAI 协议的 `stream_options.include_usage`）。所以各层类型里它都是可空的，
+ * 「没有」和「是 0」必须能分开 —— 没有的数字不能参与求和，否则成本看起来永远偏低。
+ */
+export interface LlmUsage {
+  promptTokens: number;
+  completionTokens: number;
 }
 
 export interface LlmRequestOptions {
@@ -20,20 +70,42 @@ export interface LlmRequestOptions {
    */
   signal?: AbortSignal;
   temperature?: number;
+  /** 这一轮允许模型用的工具。不传 = 纯文本问答（老路径）。 */
+  tools?: LlmToolSpec[];
 }
 
 export interface LlmCompletion {
-  /** 模型返回的原始文本。注意：这里不做任何解析 —— 解析是调用方的事。 */
+  /** 模型返回的原始文本。调工具的那一轮通常是空串。注意：这里不做任何解析。 */
   text: string;
   /** 实际用的模型名。真实厂商在响应信封里给，所以和 text 一起返回。 */
   model: string;
+  /** 这一轮模型要求调用的工具。空数组 = 它给了最终答案。 */
+  toolCalls: LlmToolCall[];
+  /** 厂商报的用量。没报就是 undefined —— 别用 0 冒充「没花 token」。 */
+  usage?: LlmUsage;
 }
+
+/**
+ * 流式事件。
+ *
+ * 文本是真的一段段到的；工具调用是**分片**到的（`index` 相同的是同一个调用，
+ * name 和 arguments 各来一部分），所以 provider 会攒到流结束才发 `tool_call` 事件。
+ * 这对调用方是好事：它拿到的永远是完整的调用，不用自己拼碎片。
+ *
+ * `usage` 单独成一种事件，而不是挂在 `LlmStream` 信封上：用量在**流的末尾**才到
+ * （有的厂商是最后一帧，choices 为空、只带 usage），而信封在第一个字之前就返回了。
+ * 想在信封里拿到它，就只能等整条流读完 —— 那就等于取消了流式。
+ */
+export type LlmStreamEvent =
+  | { type: 'text'; text: string }
+  | { type: 'tool_call'; call: LlmToolCall }
+  | { type: 'usage'; usage: LlmUsage };
 
 /**
  * 流式响应。
  *
- * 为什么是「先 await 拿到信封，再消费 chunks」，而不是直接返回一个裸的
- * `AsyncIterable<string>`：两件真实存在的事只有这个形状能表达。
+ * 为什么是「先 await 拿到信封，再消费 events」，而不是直接返回一个裸的
+ * `AsyncIterable`：两件真实存在的事只有这个形状能表达。
  *
  *   1. **模型名要在第一个 token 之前就确定。** 真实厂商把它放在响应信封里，
  *      和连接是否成功一起返回。裸迭代器要到消费时才知道。
@@ -44,7 +116,7 @@ export interface LlmCompletion {
  */
 export interface LlmStream {
   model: string;
-  chunks: AsyncIterable<string>;
+  events: AsyncIterable<LlmStreamEvent>;
 }
 
 export interface LlmProvider {

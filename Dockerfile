@@ -9,9 +9,12 @@
 # 把它们塞进同一个镜像，等于让长期运行的那个进程白白带着构建工具，
 # 以及一份「能改 schema」的能力。
 #
-# ⚠️ 基础镜像固定到小版本，不用 `node:20-alpine` 这种飘动的 tag：
+# ⚠️ 基础镜像固定到小版本，不用 `node:24-alpine` 这种飘动的 tag：
 # 飘动的 tag 会让「昨天能构建，今天构建出别的东西」，而这类问题最难查。
-ARG NODE_IMAGE=node:20.20.2-alpine
+#
+# 版本要和 .nvmrc 一致：CI 用 .nvmrc 装 Node，这里用同一个小版本，
+# 两边跑出来的才是一套东西。
+ARG NODE_IMAGE=node:24.22.0-alpine
 
 # ────────────────────────────────────────────────────────────
 # 1. 依赖
@@ -103,9 +106,11 @@ EXPOSE 3100
 
 # 探活直接问应用自己的 /health，而不是只查端口通不通 ——
 # 端口开着但数据库连不上时，后者会一直报健康。
+# /health 内部会真的发一条 `select 1`（2s 上限，见 src/app.controller.ts），
+# 所以这里的 3s 超时必须比它长，否则先到的永远是探针自己的超时。
 #
 # 用 node 自带的 fetch 而不是 curl：alpine 镜像里没有 curl，
-# 为了一个探针去 apk add 一个包不划算；Node 20 有全局 fetch。
+# 为了一个探针去 apk add 一个包不划算；Node 22+ 有全局 fetch。
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3100)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 

@@ -8,7 +8,7 @@
  * 「首字延迟 ≪ 总耗时」这个差距，只有真的一块一块发才有 ——
  * 攒完再吐的实现里，两者会几乎相等。
  *
- * ⚠️ 用假模型时这个差距是被两个常量（CHUNK_SIZE / CHUNK_DELAY_MS）**造出来**的，
+ * ⚠️ 用假模型时这个差距是被两个参数（CHUNK_SIZE / MOCK_CHUNK_DELAY_MS）**造出来**的，
  * 不是模型的速度。它能证明管道是流式的，不能证明模型有多快。
  */
 const [, , code = 'BX-2026-0006', question = '这笔钱都花在哪些项目上？'] = process.argv;
@@ -35,6 +35,7 @@ const decoder = new TextDecoder();
 let buffer = '';
 let chars = 0;
 let firstAt = null;
+let pings = 0;
 
 for (;;) {
   const { done, value } = await reader.read();
@@ -47,6 +48,13 @@ for (;;) {
   while ((boundary = buffer.indexOf('\n\n')) !== -1) {
     const frame = buffer.slice(0, boundary);
     buffer = buffer.slice(boundary + 2);
+
+    // 注释帧（`: ping`）是心跳，没有 data。按规范忽略，只计数 ——
+    // 工具轮里几秒钟没字时，就是它在替连接续命（见 assistant.controller.ts）。
+    if (!frame.includes('data:')) {
+      pings += 1;
+      continue;
+    }
 
     const name = /event: (\w+)/.exec(frame)?.[1];
     const data = JSON.parse(frame.slice(frame.indexOf('data: ') + 6));
@@ -63,5 +71,5 @@ for (;;) {
 }
 
 console.log(
-  `\n首字延迟 ${firstAt} ms ／ 总耗时 ${Math.round(performance.now() - started)} ms ／ 增量共 ${chars} 字`,
+  `\n首字延迟 ${firstAt} ms ／ 总耗时 ${Math.round(performance.now() - started)} ms ／ 增量共 ${chars} 字 ／ 心跳 ${pings} 次`,
 );

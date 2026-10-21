@@ -3,83 +3,220 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>报销单问答 · 流式演示</title>
+<title>报销单问答</title>
 <style>
   :root {
     --line: #e3e6ea;
     --ink: #1f2328;
     --dim: #6b7480;
     --accent: #2f6fed;
+    --accent-ink: #2559c9;
     --ok: #1a7f45;
     --warn: #9a6700;
     --bad: #b42318;
-    --bg-soft: #f6f8fa;
+    --bg: #f7f8fa;
+    --card: #fff;
+    --soft: #f1f3f6;
+    --radius: 12px;
   }
   * { box-sizing: border-box; }
+
+  /* 整页是一个「上中下」三段的应用外壳：头部固定、中间滚动、输入框常驻。
+     高度用 dvh 而不是 vh —— 手机上 vh 不扣掉地址栏，输入框会被顶到屏幕外。 */
   body {
-    margin: 0 auto;
-    padding: 32px 20px 64px;
-    max-width: 780px;
+    margin: 0;
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
     font: 15px/1.7 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
     color: var(--ink);
-    background: #fff;
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
   }
-  h1 { margin: 0 0 6px; font-size: 20px; }
-  .sub { margin: 0 0 28px; color: var(--dim); font-size: 13px; }
 
-  .field { margin-bottom: 14px; }
-  label { display: block; margin-bottom: 6px; font-size: 13px; color: var(--dim); }
-  input {
-    width: 100%;
-    padding: 9px 11px;
-    font: inherit;
-    color: inherit;
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    background: #fff;
+  /* ---------------------------------------------------------------- 头部 */
+
+  /* 实心白 + 一条底线。
+     原来这里是半透明白配 backdrop-filter 毛玻璃。玻璃拟态挂在常驻顶栏上
+     没有收益 —— 它底下就是滚动的消息，半透明只会让文字从缝里透出来。 */
+  .topbar {
+    flex: none;
+    border-bottom: 1px solid var(--line);
+    background: var(--card);
   }
-  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  .topbar-inner {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo {
+    flex: none;
+    width: 30px; height: 30px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 600;
+  }
+  h1 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.3; }
+  .sub { margin: 0; font-size: 12px; color: var(--dim); line-height: 1.3; }
 
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-  button {
-    padding: 9px 16px;
-    font: inherit;
+  /* 单号选择器。
+     这里一开始用的是 input + datalist，换掉了 —— datalist 在浏览器里
+     **点一下不会展开**，得先敲字才提示，等于把可选项藏起来。
+     所以自己做一个：按钮 + 面板，点开就是全部 10 张单，带标题和状态。 */
+  .picker { margin-left: auto; flex: none; position: relative; }
+  .code-pill {
+    display: flex; align-items: center; gap: 7px;
+    padding: 5px 11px;
     border: 1px solid var(--line);
-    border-radius: 7px;
-    background: #fff;
+    border-radius: 99px;
+    background: var(--card);
+    font: inherit;
+    color: var(--ink);
     cursor: pointer;
   }
-  button:hover:not(:disabled) { background: var(--bg-soft); }
-  button:disabled { opacity: .45; cursor: default; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.primary:hover:not(:disabled) { background: #2559c9; }
+  .code-pill:hover { border-color: #c9cfd7; }
+  .code-pill[aria-expanded="true"] {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(47, 111, 237, .12);
+  }
+  .code-pill-label { font-size: 12px; color: var(--dim); }
+  .code-value { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .chev { width: 11px; height: 11px; color: var(--dim); transition: transform .15s; }
+  .code-pill[aria-expanded="true"] .chev { transform: rotate(180deg); }
 
-  .presets { margin: 16px 0 26px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .presets button { font-size: 13px; padding: 5px 11px; color: var(--dim); }
+  .code-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 20;
+    width: 296px;
+    max-width: calc(100vw - 28px);
+    padding: 6px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(31, 35, 40, .14);
+  }
+  .code-menu[hidden] { display: none; }
+  .menu-head { padding: 6px 10px 8px; font-size: 12px; color: var(--dim); }
+  .code-list { max-height: 300px; overflow-y: auto; }
 
-  .panel {
+  .code-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1px 10px;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .code-row:hover { background: var(--soft); }
+  .code-row[aria-selected="true"] { background: #eef4fe; }
+  .code-row-code { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .code-row-title { grid-column: 1 / -1; font-size: 12px; color: var(--dim); }
+
+  .chip { font-size: 11px; line-height: 1.7; padding: 0 7px; border-radius: 99px; white-space: nowrap; }
+  .chip.paid, .chip.approved { background: #e6f4ec; color: var(--ok); }
+  .chip.rejected { background: #fdeceb; color: var(--bad); }
+  .chip.submitted { background: #e8f0fe; color: var(--accent); }
+  .chip.draft { background: var(--soft); color: var(--dim); }
+
+  .menu-foot {
+    margin-top: 6px;
+    padding: 8px 6px 2px;
+    border-top: 1px solid var(--line);
+  }
+  .menu-foot input {
+    width: 100%;
+    padding: 7px 10px;
     border: 1px solid var(--line);
     border-radius: 9px;
-    padding: 18px 20px 16px;
+    background: var(--card);
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--ink);
   }
-  .panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-  .badge {
-    font-size: 12px;
-    padding: 2px 9px;
-    border-radius: 99px;
-    background: var(--bg-soft);
+  .menu-foot input:focus {
+    outline: 0;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(47, 111, 237, .12);
+  }
+
+  /* ---------------------------------------------------------------- 消息区 */
+
+  .chat {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 24px 20px 8px;
+    scroll-behavior: smooth;
+  }
+
+  .turn {
+    max-width: 760px;
+    margin: 0 auto 18px;
+    display: flex;
+    gap: 10px;
+  }
+  .turn.user { justify-content: flex-end; }
+  .turn.bot { justify-content: flex-start; }
+
+  .avatar {
+    flex: none;
+    width: 30px; height: 30px;
+    margin-top: 2px;
+    border-radius: 50%;
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: var(--dim);
+    display: grid; place-items: center;
+    font-size: 11.5px; font-weight: 600;
+  }
+
+  .stack { display: flex; flex-direction: column; min-width: 0; max-width: 78%; }
+  .turn.user .stack { align-items: flex-end; }
+
+  .bubble {
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .turn.user .bubble {
+    background: var(--accent);
+    color: #fff;
+    border-bottom-right-radius: 5px;
+  }
+  .turn.bot .bubble {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-bottom-left-radius: 5px;
+  }
+  .turn.bot.error .bubble { background: #fdeceb; border-color: #f5c9c5; color: var(--bad); }
+  .bubble p { margin: 0; }
+
+  .code-tag {
+    margin: 0 2px 5px;
+    font: 11.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--dim);
   }
-  .badge.streaming    { background: #e8f0fe; color: var(--accent); }
-  .badge.done         { background: #e6f4ec; color: var(--ok); }
-  .badge.insufficient { background: #fdf3e0; color: var(--warn); }
-  .badge.error        { background: #fdeceb; color: var(--bad); }
 
-  #conclusion { margin: 0; min-height: 1.7em; white-space: pre-wrap; }
-  #conclusion.caret::after {
+  /* 生成中的光标。挂在最后那个字符后面，而不是单独占一行。 */
+  .bubble.streaming p:not(:empty)::after {
     content: "";
     display: inline-block;
-    width: 7px; height: 1.05em;
+    width: 7px; height: 1.02em;
     margin-left: 1px;
     vertical-align: text-bottom;
     background: var(--accent);
@@ -87,130 +224,450 @@
   }
   @keyframes blink { 50% { opacity: 0; } }
 
-  .evidence { margin-top: 14px; display: flex; gap: 6px; flex-wrap: wrap; }
-  .evidence:empty { display: none; }
-  .evidence code {
+  /* 「正在想」的三个点 —— 首字还没到的那段时间里气泡不能是空的。 */
+  .bubble.pending p:empty::after {
+    content: "";
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--dim);
+    box-shadow: 12px 0 0 var(--dim), 24px 0 0 var(--dim);
+    margin-bottom: 2px;
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+  /* ---------------------------------------------------------------- 气泡下方的元信息 */
+
+  .meta {
+    margin: 7px 2px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
     font-size: 12px;
-    padding: 2px 8px;
+    color: var(--dim);
+  }
+  .meta:empty { display: none; }
+
+  .status { display: inline-flex; align-items: center; gap: 5px; }
+  .status .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .status.streaming    { color: var(--accent); }
+  .status.streaming .dot { animation: pulse 1.2s ease-in-out infinite; }
+  .status.done         { color: var(--ok); }
+  .status.insufficient { color: var(--warn); }
+  .status.error        { color: var(--bad); }
+  .status.stopped      { color: var(--dim); }
+
+  .tags { display: flex; gap: 5px; flex-wrap: wrap; }
+  .tags code {
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 1px 7px;
     border-radius: 5px;
-    background: var(--bg-soft);
+    background: var(--card);
     border: 1px solid var(--line);
     color: var(--dim);
   }
 
   .metrics {
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px dashed var(--line);
-    font-size: 12px;
+    margin: 6px 2px 0;
+    font: 11.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: var(--dim);
   }
+  .metrics:empty { display: none; }
   .metrics b { color: var(--ink); font-weight: 600; }
-  .hint { margin-top: 22px; font-size: 12.5px; color: var(--dim); }
+
+  /* ---------------------------------------------------------------- 空状态 */
+
+  .empty {
+    max-width: 760px;
+    margin: 8vh auto 0;
+    text-align: center;
+    padding: 0 4px;
+  }
+  .empty[hidden] { display: none; }
+  .empty h2 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  .empty p { margin: 0 0 20px; font-size: 13px; color: var(--dim); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .chips button {
+    padding: 8px 14px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 99px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .chips button:hover { border-color: var(--accent); color: var(--accent); }
+  .empty .footnote {
+    margin: 34px 0 0;
+    font-size: 12px;
+    line-height: 1.75;
+    color: var(--dim);
+  }
+
+  /* ---------------------------------------------------------------- 输入区 */
+
+  .composer {
+    flex: none;
+    padding: 12px 20px 14px;
+    background: linear-gradient(to bottom, rgba(247, 248, 250, 0), var(--bg) 32%);
+  }
+  .composer-inner { max-width: 760px; margin: 0 auto; }
+
+  form {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 7px 7px 7px 15px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    box-shadow: 0 1px 2px rgba(31, 35, 40, .04);
+    transition: border-color .12s, box-shadow .12s;
+  }
+  form:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(47, 111, 237, .12); }
+
+  textarea {
+    flex: 1;
+    min-width: 0;
+    max-height: 132px;
+    padding: 6px 0;
+    border: 0; outline: 0; resize: none;
+    font: inherit;
+    color: inherit;
+    background: transparent;
+    overflow-y: auto;
+  }
+
+  .send {
+    flex: none;
+    width: 34px; height: 34px;
+    border: 0;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    display: grid; place-items: center;
+    cursor: pointer;
+    transition: background .12s;
+  }
+  .send:hover:not(:disabled) { background: var(--accent-ink); }
+  .send:disabled { opacity: .35; cursor: default; }
+  .send svg { width: 17px; height: 17px; display: block; }
+  .send .i-stop { display: none; }
+  .send.stopping { background: var(--ink); }
+  .send.stopping .i-send { display: none; }
+  .send.stopping .i-stop { display: block; }
+
+  .footnote {
+    margin: 9px 0 0;
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--dim);
+  }
+
+  @media (max-width: 620px) {
+    .topbar-inner, .chat, .composer { padding-left: 14px; padding-right: 14px; }
+    .stack { max-width: 88%; }
+    .sub { display: none; }
+    /* 单号是 12 位的等宽串，窄屏上先让「单号」两个字让位 ——
+       把这串截断比少一个标签更糟：那是这一轮问的是哪张单子。 */
+    .code-pill { padding: 5px 10px; }
+    .code-pill-label { display: none; }
+    .code-value { font-size: 12px; }
+  }
 </style>
 </head>
 <body>
 
-<h1>报销单问答</h1>
-<p class="sub">一个字一个字出来的是模型的原始输出；结束时才变成「已确认」—— 那一瞬间走的是和非流式端点完全相同的校验。</p>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">报</div>
+      <div>
+        <h1>报销单问答</h1>
+        <p class="sub">流式输出演示</p>
+      </div>
+    </div>
 
-<div class="field">
-  <label for="code">单号</label>
-  <input id="code" value="BX-2026-0003" spellcheck="false">
-</div>
+    <div class="picker">
+      <button id="codePill" class="code-pill" type="button" aria-haspopup="listbox" aria-expanded="false">
+        <span class="code-pill-label">单号</span>
+        <span id="codeValue" class="code-value">BX-2026-0003</span>
+        <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.5 4.5 6 8l3.5-3.5"/>
+        </svg>
+      </button>
 
-<div class="field">
-  <label for="question">问题</label>
-  <input id="question" value="这张单子为什么被驳回了？">
-</div>
-
-<div class="row">
-  <button id="ask" class="primary">问一句</button>
-  <button id="stop" disabled>停止</button>
-</div>
-
-<div class="presets">
-  <button data-code="BX-2026-0003" data-question="这张单子为什么被驳回了？">已驳回的单子</button>
-  <button data-code="BX-2026-0005" data-question="审批意见是什么？">草稿单问审批（应信息不足）</button>
-  <button data-code="BX-2026-0006" data-question="这笔钱都花在哪些项目上？">问明细</button>
-</div>
-
-<div class="panel">
-  <div class="panel-head">
-    <span id="badge" class="badge">待提问</span>
+      <div id="codeMenu" class="code-menu" hidden>
+        <div class="menu-head">选一张报销单</div>
+        <div id="codeList" class="code-list" role="listbox" aria-label="报销单"></div>
+        <div class="menu-foot">
+          <input id="codeManual" placeholder="或手打单号，回车确认（试试 9999）" spellcheck="false" autocomplete="off">
+        </div>
+      </div>
+    </div>
   </div>
-  <p id="conclusion"></p>
-  <div id="evidence" class="evidence"></div>
-  <div id="metrics" class="metrics"></div>
-</div>
+</header>
 
-<p class="hint">
-  改 <code>src/modules/llm/mock-llm.provider.ts</code> 里那两个常量（每块几个字、块间隔），
-  首字延迟和总耗时的差距会跟着变 —— 这正是「真流式」和「攒完再吐」的区别。
-</p>
+<main id="chat" class="chat">
+  <div id="empty" class="empty">
+    <h2>问点关于报销单的事</h2>
+    <p>先在上面选单号，或者直接点下面的例子</p>
+    <div class="chips" id="chips"></div>
+    <p class="footnote">
+      答案是一个字一个字出现的：那是模型的原始输出，结束时才被最终校验过的版本覆盖 ——<br>
+      所以最后那一下「跳」，是两个版本在交接，不是显示错乱。
+    </p>
+  </div>
+</main>
+
+<footer class="composer">
+  <div class="composer-inner">
+    <form id="form">
+      <textarea id="question" rows="1" placeholder="问一句…（Enter 发送，Shift + Enter 换行）"></textarea>
+      <button id="send" class="send" type="submit" aria-label="发送">
+        <svg class="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 19V5M5 12l7-7 7 7"/>
+        </svg>
+        <svg class="i-stop" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <rect x="7" y="7" width="10" height="10" rx="2"/>
+        </svg>
+      </button>
+    </form>
+    <p class="footnote">每轮问答互不影响 —— 这一版后端没有多轮上下文</p>
+  </div>
+</footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
 
-const BADGE_TEXT = {
-  idle: '待提问',
+const chat = $('chat');
+const empty = $('empty');
+const questionInput = $('question');
+const form = $('form');
+const sendBtn = $('send');
+const pill = $('codePill');
+const menu = $('codeMenu');
+
+/**
+ * 库里的 10 张单，这里硬编了一份精简版。
+ *
+ * 抄一份而不是走接口，理由是这个面板要回答的是「哪张值得问」——
+ * 光有单号看不出来，得带上标题和状态。真产品里这张表应当来自一个列表接口，
+ * 而不是在页面上再维护一份 —— 会和种子数据慢慢对不上。
+ */
+const EXPENSES = [
+  { code: 'BX-2026-0001', title: '北京客户现场支持差旅', status: 'paid', label: '已打款' },
+  { code: 'BX-2026-0002', title: '研发部工位外设采购', status: 'approved', label: '已通过' },
+  { code: 'BX-2026-0003', title: '客户答谢晚宴', status: 'rejected', label: '已驳回' },
+  { code: 'BX-2026-0004', title: '3 月市内客户拜访交通', status: 'submitted', label: '待审批' },
+  { code: 'BX-2026-0005', title: '财务部办公耗材', status: 'draft', label: '草稿' },
+  { code: 'BX-2026-0006', title: '上海架构评审出差', status: 'paid', label: '已打款' },
+  { code: 'BX-2026-0007', title: '季度团建餐费', status: 'submitted', label: '待审批' },
+  { code: 'BX-2026-0008', title: '行业展会物料制作', status: 'approved', label: '已通过' },
+  { code: 'BX-2026-0009', title: '杭州供应商走访差旅', status: 'rejected', label: '已驳回' },
+  { code: 'BX-2026-0010', title: '招聘平台年度续费', status: 'draft', label: '草稿' },
+];
+
+const PRESETS = [
+  { code: 'BX-2026-0003', question: '这张单子为什么被驳回了？', label: '被驳回的单子' },
+  { code: 'BX-2026-0005', question: '审批意见是什么？', label: '草稿单问审批' },
+  { code: 'BX-2026-0006', question: '这笔钱都花在哪些项目上？', label: '问费用明细' },
+  { code: 'BX-2026-0001', question: '一共多少钱？', label: '问金额' },
+  { code: 'BX-9999-9999', question: '这张单子多少钱？', label: '不存在的单号（404）' },
+];
+
+const STATUS_TEXT = {
   streaming: '生成中…',
   done: '已确认',
   insufficient: '信息不足',
-  stopped: '已停止',
+  stopped: '已停止（文字未经最终校验）',
   error: '出错',
 };
 
+/**
+ * 工具名 → 页面上显示的中文短标签。
+ *
+ * 长名字（get_expense_summary）挤在那一行里会把「首字延迟 / 总耗时」顶掉，
+ * 而这里要说的只有一件事：它查的是哪一块。评测报告用的是同一套标签。
+ */
+const TOOL_LABEL = {
+  get_expense_summary: '表头',
+  list_expense_items: '明细',
+  get_approval_record: '审批',
+};
+
+let currentCode = 'BX-2026-0003';
 let controller = null;
 
-// ---------------------------------------------------------------- 交互
+/**
+ * 当前这张单子的对话历史 —— 只存上一轮**被校验过**的三个字段，不存原文。
+ *
+ * 服务端不存会话（见 README「多轮」），所以历史由页面负责回传。存结构化摘要
+ * 而不是整段对话，有两个直接后果：请求体不会随轮数越变越大；
+ * 历史里也不会混进「流到一半被打断」那种没经过最终校验的半句话。
+ */
+let history = [];
 
-$('ask').addEventListener('click', ask);
-$('stop').addEventListener('click', () => controller && controller.abort());
+// ---------------------------------------------------------------- 初始化
 
-for (const preset of document.querySelectorAll('.presets button')) {
-  preset.addEventListener('click', () => {
-    $('code').value = preset.dataset.code;
-    $('question').value = preset.dataset.question;
-    ask();
+for (const item of EXPENSES) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'code-row';
+  row.dataset.code = item.code;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', 'false');
+
+  const code = document.createElement('span');
+  code.className = 'code-row-code';
+  code.textContent = item.code;
+
+  const chip = document.createElement('span');
+  chip.className = `chip ${item.status}`;
+  chip.textContent = item.label;
+
+  const title = document.createElement('span');
+  title.className = 'code-row-title';
+  title.textContent = item.title;
+
+  row.append(code, chip, title);
+  row.addEventListener('click', () => {
+    setCode(item.code);
+    openMenu(false);
   });
+  $('codeList').appendChild(row);
 }
 
-for (const input of document.querySelectorAll('input')) {
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') ask();
+for (const preset of PRESETS) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = preset.label;
+  button.addEventListener('click', () => {
+    setCode(preset.code);
+    questionInput.value = preset.question;
+    ask();
   });
+  $('chips').appendChild(button);
+}
+
+setCode(currentCode);
+
+function setCode(code) {
+  // 换单子就换话题：历史是「这张单子」的上下文，带过去会诱导模型把上一张的
+  // 结论当成这一张的依据。服务端虽然会按本次单号重新查数据，但结论里的
+  // 具体数字来自历史，那是最难被发现的一种串台。
+  if (code !== currentCode) history = [];
+
+  currentCode = code;
+  $('codeValue').textContent = code;
+  for (const row of $('codeList').children) {
+    row.setAttribute('aria-selected', String(row.dataset.code === code));
+  }
+}
+
+function openMenu(open) {
+  menu.hidden = !open;
+  pill.setAttribute('aria-expanded', String(open));
+  if (open) $('codeManual').value = '';
+}
+
+pill.addEventListener('click', () => openMenu(menu.hidden));
+
+// 点面板外面收起来。判的是 closest('.picker') 而不是 closest('#codeMenu')：
+// 那颗按钮自己也在「里面」，否则刚点开就会被这条关掉。
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.picker')) openMenu(false);
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') openMenu(false);
+});
+
+// 手打一个单号。这条路留着是为了演示 404 —— 面板里那 10 张都是存在的。
+$('codeManual').addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.isComposing) return;
+  const typed = event.target.value.trim().toUpperCase();
+  if (!typed) return;
+  setCode(typed);
+  openMenu(false);
+});
+
+// ---------------------------------------------------------------- 输入
+
+form.addEventListener('submit', (event) => {
+  // 生成中时这个按钮是「停止」，不是「发送」—— 所以先拦在这里，别进了 ask()。
+  event.preventDefault();
+  if (controller) {
+    controller.abort();
+    return;
+  }
+  ask();
+});
+
+questionInput.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.shiftKey) return;
+
+  // ⚠️ 中文输入法选词也是回车。不判 isComposing 的话，每次选字都会把半截问题发出去。
+  if (event.isComposing) return;
+
+  event.preventDefault();
+  if (!controller) ask();
+});
+
+questionInput.addEventListener('input', autogrow);
+
+function autogrow() {
+  questionInput.style.height = 'auto';
+  questionInput.style.height = `${Math.min(questionInput.scrollHeight, 132)}px`;
 }
 
 // ---------------------------------------------------------------- 主流程
 
 async function ask() {
-  const code = $('code').value.trim();
-  const question = $('question').value.trim();
+  const code = currentCode;
+  const question = questionInput.value.trim();
   if (!code || !question || controller) return;
 
-  controller = new AbortController();
-  $('ask').disabled = true;
-  $('stop').disabled = false;
-  $('conclusion').textContent = '';
-  $('evidence').innerHTML = '';
-  $('metrics').textContent = '';
-  setBadge('streaming', /* caret */ true);
+  empty.hidden = true;
+  questionInput.value = '';
+  autogrow();
+  setBusy(true);
 
+  addUserTurn(code, question);
+  const bot = addBotTurn();
+
+  controller = new AbortController();
   const startedAt = performance.now();
   let firstDeltaAt = null;
   let deltaChars = 0;
+  // 服务端给这次请求编的 id（响应头里）。用户报「刚才那次很慢」时，
+  // 这是唯一能对上服务端日志的东西 —— 所以失败时要让他看得见。
+  let requestId = null;
+
+  // 快照：请求飞出去之后 history 还可能被别的操作改掉（比如用户换了单号），
+  // 而这次请求该带的是「发出去那一刻」的上下文。
+  const turns = history.slice(-3);
+  const payload = turns.length > 0 ? { code, question, history: turns } : { code, question };
 
   try {
     const response = await fetch('/assistant/askStream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, question }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
     // 后端在写 SSE 响应头**之前**就取完数了，所以「单号不存在」「参数不合法」
     // 这类错误在这里还能拿到一个正常的 JSON 响应 —— 不是一段流。
+    requestId = response.headers.get('x-request-id');
+    bot.requestId = requestId;
     if (!response.ok) {
       const body = await response.json().catch(() => null);
       const message = body && body.message;
@@ -222,6 +679,10 @@ async function ask() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
+    // 收到 done 或 error 才算「有结论」。服务端如果因为意外直接关了连接
+    // （没有这两种帧），循环也会正常结束 —— 不记这个标志的话，页面会永远
+    // 停在「生成中」，用户不知道是慢还是断了。
+    let settled = false;
 
     for (;;) {
       const { done, value } = await reader.read();
@@ -240,68 +701,247 @@ async function ask() {
         const frame = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
 
-        const { name, data } = parseFrame(frame);
+        const parsed = parseFrame(frame);
+        // 心跳是注释帧（`: ping`），没有 data。规范要求客户端忽略它 ——
+        // 它存在的唯一目的，是让代理别把「工具轮里几秒钟没字」当成空闲连接掐掉。
+        if (!parsed) continue;
+
+        const { name, data } = parsed;
 
         if (name === 'delta') {
           if (firstDeltaAt === null) firstDeltaAt = performance.now();
           deltaChars += data.text.length;
-          $('conclusion').textContent += data.text;
+          bot.bubble.classList.remove('pending');
+          bot.bubble.classList.add('streaming');
+          bot.text.textContent += data.text;
+          follow();
         } else if (name === 'done') {
-          finish(data, startedAt, firstDeltaAt, deltaChars);
+          settled = true;
+          finish(bot, data, startedAt, firstDeltaAt, deltaChars);
+          remember(question, data);
         } else if (name === 'error') {
-          setBadge('error');
-          $('conclusion').textContent = data.message;
+          settled = true;
+          fail(bot, data.message);
         }
       }
     }
+
+    // 流正常结束（EOF）但没等到终态帧：服务端在收口之前出了问题，或者
+    // 某个代理把连接关掉了。已经显示的字保留，但必须明确告诉用户「不完整」——
+    // 静默留在「生成中」是最坏的一种：看起来像卡住，实际早就结束了。
+    if (!settled) {
+      fail(bot, '连接提前结束了，这次回答不完整，请重试');
+    }
   } catch (error) {
     if (error.name === 'AbortError') {
-      setBadge('stopped');
+      stop(bot, startedAt);
     } else {
-      setBadge('error');
-      $('conclusion').textContent = error.message;
+      fail(bot, error.message);
     }
   } finally {
     controller = null;
-    $('ask').disabled = false;
-    $('stop').disabled = true;
+    setBusy(false);
+    follow();
   }
 }
 
 // ---------------------------------------------------------------- 渲染
 
-function finish(result, startedAt, firstDeltaAt, deltaChars) {
+/**
+ * 一条用户消息。单号跟着气泡一起留在历史里 ——
+ * 后面换过单号之后，回头看也知道当时问的是哪张单子。
+ */
+function addUserTurn(code, question) {
+  const turn = document.createElement('div');
+  turn.className = 'turn user';
+
+  const stack = document.createElement('div');
+  stack.className = 'stack';
+
+  const tag = document.createElement('span');
+  tag.className = 'code-tag';
+  tag.textContent = code;
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  const text = document.createElement('p');
+  text.textContent = question;
+  bubble.appendChild(text);
+
+  stack.append(tag, bubble);
+  turn.appendChild(stack);
+  chat.appendChild(turn);
+  follow();
+}
+
+/** 一条回答消息。返回它的各个部件，后面边收边往里填。 */
+function addBotTurn() {
+  const turn = document.createElement('div');
+  turn.className = 'turn bot';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = 'AI';
+
+  const stack = document.createElement('div');
+  stack.className = 'stack';
+
+  const bubble = document.createElement('div');
+  // pending：首字还没到。气泡里空着会像个 bug，所以先显示跳动的点。
+  bubble.className = 'bubble pending';
+  const text = document.createElement('p');
+  bubble.appendChild(text);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+
+  const status = document.createElement('span');
+  status.className = 'status streaming';
+  status.innerHTML = '<i class="dot"></i>';
+  const statusText = document.createElement('span');
+  statusText.textContent = STATUS_TEXT.streaming;
+  status.appendChild(statusText);
+
+  const tags = document.createElement('span');
+  tags.className = 'tags';
+
+  const metrics = document.createElement('div');
+  metrics.className = 'metrics';
+
+  meta.append(status, tags);
+  stack.append(bubble, meta, metrics);
+  turn.append(avatar, stack);
+  chat.appendChild(turn);
+
+  return { turn, bubble, text, status, statusText, tags, metrics };
+}
+
+function finish(bot, result, startedAt, firstDeltaAt, deltaChars) {
   // 用最终结果**覆盖**增量阶段吐出来的文本，而不是接着它写。
   // 两者理论上一样，但最终结果经过 parseAnswer（trim、去重）——
   // 让页面显示的那一份，永远是被校验过的那一份。
-  $('conclusion').textContent = result.conclusion;
-  setBadge(result.insufficient ? 'insufficient' : 'done');
+  bot.bubble.classList.remove('streaming', 'pending');
+  bot.text.textContent = result.conclusion;
+
+  setStatus(bot, result.insufficient ? 'insufficient' : 'done');
 
   for (const field of result.evidence) {
     const tag = document.createElement('code');
     tag.textContent = field;
-    $('evidence').appendChild(tag);
+    bot.tags.appendChild(tag);
   }
 
   const elapsed = (at) => (at === null ? '—' : `${Math.round(at - startedAt)} ms`);
-  $('metrics').innerHTML =
+  // 用量来自厂商，服务端刻意不拿「报了的几轮」凑整次请求：任一轮没报就是 null。
+  // 所以这里必须把「没报」和「是 0」分开显示 —— 一个半截统计戴上精确的外表最危险。
+  const usage = result.metrics?.usage ?? null;
+  const tokens = usage
+    ? `<b>${usage.promptTokens + usage.completionTokens}</b> tokens`
+    : 'tokens <b>未报</b>';
+  bot.metrics.innerHTML =
     `首字延迟 <b>${elapsed(firstDeltaAt)}</b>` +
     `　·　总耗时 <b>${Math.round(performance.now() - startedAt)} ms</b>` +
+    `　·　${tokens}` +
     `　·　增量 <b>${deltaChars}</b> 字　·　最终 <b>${result.conclusion.length}</b> 字`;
-}
 
-function setBadge(state, caret = false) {
-  const badge = $('badge');
-  badge.className = `badge ${state === 'idle' ? '' : state}`.trim();
-  badge.textContent = BADGE_TEXT[state];
-  $('conclusion').classList.toggle('caret', caret);
+  // trace 是「这个回答是怎么来的」的唯一可见证据：模型自己决定查了什么。
+  // 用 textContent 而不是拼进上面的 innerHTML —— 工具名来自服务端，
+  // 页面不该把任何服务端字符串当成 HTML 解析。
+  const tools = (result.trace ?? []).map((step) => {
+    const label = TOOL_LABEL[step.tool] ?? step.tool;
+    return step.ok ? label : `${label}（失败）`;
+  });
+  if (tools.length > 0) {
+    const line = document.createElement('span');
+    line.textContent = `　·　查了 ${tools.join(' → ')}`;
+    bot.metrics.appendChild(line);
+  }
+
+  showRequestId(bot);
 }
 
 /**
- * 解析一个 SSE 帧。
+ * 把请求 id 放到这一轮的指标区（成功时是附属信息，失败时是唯一线索）。
+ *
+ * 用 textContent 而不是拼 HTML：这个值虽然经过服务端白名单校验，
+ * 但「服务端字符串不当 HTML 解析」这条规矩不该为了一个 id 破例。
+ * 失败路径上指标区是空的，所以分隔符按有没有前文来定。
+ */
+function showRequestId(bot) {
+  if (!bot.requestId) return;
+  const line = document.createElement('span');
+  const separator = bot.metrics.childNodes.length > 0 ? '　·　' : '';
+  line.textContent = `${separator}请求 ${bot.requestId}`;
+  bot.metrics.appendChild(line);
+}
+
+/**
+ * 记一轮历史。
+ *
+ * ⚠️ 只在 `done` 帧上记，而且只记结果里那三个字段。流被中断（用户点停止、断网）
+ * 时不记 —— 那时屏幕上那些字没经过 `parseAnswer`，把它当上下文带进下一轮，
+ * 等于让一段没校验的文本反过来影响后面的答案。历史里只收「已确认」的结论。
+ *
+ * 最多留 3 轮：后端 DTO 的上限就是 3，多带会被 400 打回来。
+ *
+ * 长度也在这里裁到 DTO 的上限。这是**输出回灌成输入**带来的不对称：
+ * 服务端没有限制 `conclusion` 的长度（模型写得长是它的事），但历史里的结论
+ * 超过 500 字，下一次请求就会被 DTO 拒掉 —— 用户看到的是「追问突然失败」。
+ * 宁可这一轮的历史短一点，也不要让一次成功的一问一答把下一问变成 400。
+ */
+function remember(question, result) {
+  history.push({
+    question: question.slice(0, 200),
+    conclusion: result.conclusion.slice(0, 500),
+    evidence: result.evidence.slice(0, 16).map((field) => field.slice(0, 64)),
+    insufficient: result.insufficient,
+  });
+  if (history.length > 3) history.splice(0, history.length - 3);
+}
+
+/** 中途失败：网络断了、格式校验没过、或者服务端 yield 了一个 error 事件。 */
+function fail(bot, message) {
+  bot.bubble.classList.remove('streaming', 'pending');
+  bot.turn.classList.add('error');
+  bot.text.textContent = message;
+  setStatus(bot, 'error');
+  // 失败时这个 id 尤其重要：用户报告的正是「那一次」。
+  showRequestId(bot);
+}
+
+/** 用户点了停止。已经吐出来的字留在屏幕上，但要标明它没走到最终校验。 */
+function stop(bot, startedAt) {
+  bot.bubble.classList.remove('streaming', 'pending');
+  setStatus(bot, 'stopped');
+  bot.metrics.textContent = `已收 ${Math.round(performance.now() - startedAt)} ms 后停止`;
+}
+
+function setStatus(bot, state) {
+  bot.status.className = `status ${state}`;
+  bot.statusText.textContent = STATUS_TEXT[state];
+}
+
+function setBusy(busy) {
+  sendBtn.classList.toggle('stopping', busy);
+  sendBtn.setAttribute('aria-label', busy ? '停止' : '发送');
+  questionInput.disabled = false;
+}
+
+/** 贴着底就跟着滚。用户自己往上翻着看的时候别硬把他拽回去。 */
+function follow() {
+  const gap = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+  if (gap < 120) chat.scrollTop = chat.scrollHeight;
+}
+
+/**
+ * 解析一个 SSE 帧。**注释帧返回 null**。
  *
  * 按 SSE 规范，一个帧里的多行 `data:` 要用换行拼起来再解析。
  * 我们的服务只发一行，但照规范写是零成本，将来发多行也不会突然坏掉。
+ *
+ * 没有 `data:` 的帧是注释（心跳用的 `: ping`）。不返回 null 的话，
+ * `JSON.parse('')` 会抛异常，而它会被外层的 catch 当成一次真正的失败 ——
+ * 页面在第一次空闲之后就会报错。
  */
 function parseFrame(frame) {
   let name = 'message';
@@ -312,8 +952,11 @@ function parseFrame(frame) {
     else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
   }
 
+  if (dataLines.length === 0) return null;
   return { name, data: JSON.parse(dataLines.join('\n')) };
 }
+
+autogrow();
 </script>
 </body>
 </html>

@@ -1,399 +1,248 @@
 # assistant-demo
 
-用一句自然语言问一张报销单，拿到**结构化**的答案 —— 结论 + 依据字段 + 是否信息不足。
+[![CI](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml)
 
-页面上答案是一个字一个字出来的（真流式，不是转圈等）：`npm run start:dev` 之后打开
-<http://localhost:3100>。
+**[中文](README.zh-CN.md)**
+
+Ask a natural-language question about an expense report and get a **structured, verifiable answer**: a conclusion, the fields it is based on, and whether the data was insufficient. Answers stream over SSE.
+
+Open <http://localhost:3100> after `npm run start:dev`. The default provider is a mock, so no API key is required.
+
+## Features
+
+- **Structured output** — the model must return JSON; the complete answer is validated field by field, and malformed output results in `502` instead of a partial answer.
+- **Verifiable evidence** — `evidence` only accepts fields returned by tools actually called during this request; unknown fields are removed and logged.
+- **Tool calling** — the model fetches data through three read-only tools. The expense ID is bound by the server and cannot be chosen by the model.
+- **Streaming** — the conclusion is extracted incrementally from partial JSON; streaming and non-streaming responses share the same final validation. True token-by-token streaming with a real provider; the mock simulates chunks.
+- **Multi-turn** — the client sends back the previous turn's validated conclusion; the server keeps no session state.
+- **Evaluated** — 23 cases cover tool trajectories, prompt injection, and cross-record access, run against a real database in CI.
+- **Observable** — request IDs, access logs, latency / time-to-first-token / token / cost metrics, and rejected-request counters.
+- **Mock-first** — a rule-based provider makes the full test suite reproducible without network access or credentials.
+
+## Quick start
+
+Requires Node 22.12+ and Docker.
+
+```bash
+cp .env.example .env      # defaults to PostgreSQL on localhost:5433
+npm install
+npm run db:up             # start PostgreSQL
+npm run db:migrate        # create tables
+npm run db:seed           # insert 10 fictional expense reports
+npm run start:dev         # http://localhost:3100
+```
+
+Useful scripts:
+
+| Command | Description |
+|---|---|
+| `npm run db:reset` | Reset the database and re-seed |
+| `npm run db:studio` | Database browser (localhost:5555) |
+| `npm run probe:stream` | Call the streaming endpoint and print arrival time per chunk |
+| `npm run eval` / `eval:real` | Run the evaluation suite with mock / a real model |
+| `npm run lint` / `npm test` / `npm run test:e2e` | Static checks and tests |
+| `docker compose up --build` | Database + migrations + app in containers |
+
+## Usage
+
+### Single question
 
 ```bash
 curl -X POST localhost:3100/assistant/ask \
   -H 'Content-Type: application/json' \
-  -d '{"code":"BX-2026-0003","question":"这张单子为什么被驳回了？"}'
+  -d '{"code":"BX-2026-0003","question":"Why was this report rejected?"}'
 ```
 
 ```json
 {
-  "conclusion": "BX-2026-0003 已被驳回，驳回原因：招待费超出部门月度预算，且缺少参与人员清单",
+  "conclusion": "BX-2026-0003 was rejected because the entertainment expense exceeded the department's monthly budget and the attendee list was missing.",
   "evidence": ["code", "status", "rejectReason"],
-  "insufficient": false
+  "insufficient": false,
+  "trace": [{ "tool": "get_approval_record", "ok": true }],
+  "metrics": {
+    "elapsedMs": 912,
+    "ttftMs": null,
+    "modelCalls": 2,
+    "toolMs": 18,
+    "usage": { "promptTokens": 1820, "completionTokens": 96 }
+  }
 }
 ```
 
-问一张数据里没有答案的单子，它会说「不知道」而不是编一个：
+When the data does not contain an answer, the response says so explicitly:
 
 ```json
 {
-  "conclusion": "BX-2026-0005 还没走到审批环节（草稿），数据里没有审批意见。",
+  "conclusion": "BX-2026-0005 has not reached approval yet (draft), so there is no approval comment in the data.",
   "evidence": ["code", "status"],
-  "insufficient": true
+  "insufficient": true,
+  "trace": [{ "tool": "get_approval_record", "ok": true }]
 }
 ```
 
----
+### Streaming
 
-## 这是什么，不是什么
+`POST /assistant/askStream` takes the same body and returns `text/event-stream`:
 
-**是**：一个把「结构化数据 → LLM → 可靠回答」这条路走通的最小实现。重点不在功能多，而在**每个环节都能指出具体代码**：流式怎么做的、结构化输出怎么约束的、怎么证明改了 prompt 之后没有变差。
+```
+event: delta
+data: {"text":"This "}
 
-**不是**：生产系统。没有并发设计、没有权限体系、没有可观测性，数据全是编的。
+event: delta
+data: {"text":"report "}
 
-> 这是一个**练习项目**。用途是把这条路从头走通、跑起来、部署出去。它不代表生产经验。
+event: done
+data: {"conclusion":"…","evidence":["status"],"insufficient":false,"trace":[…],"metrics":{…}}
 
----
-
-## 技术栈
-
-| 层 | 选型 | 为什么 |
-|---|---|---|
-| 框架 | NestJS 12 + TypeScript 6 | Module / Controller / Service 分层，依赖注入 |
-| 数据库 | PostgreSQL 16 + Prisma 7 | 见下面「Prisma 7 的两个坑」 |
-| 校验 | class-validator + class-transformer | DTO 在运行时校验，不只靠类型 |
-| LLM | 现在是 mock（规则表），接口已按换厂商设计 | 见下面「模型答得不对时」 |
-| 测试 | vitest | — |
-
-**刻意不引入**：前端框架（一个 `index.html` 就够）、Redis、消息队列、GraphQL、微服务。这个项目要证明的是「我能把一个服务搭起来并部署」，不是「我会堆中间件」。
-
----
-
-## 跑起来
-
-前置：Node 20+、Docker。
-
-```bash
-cp .env.example .env          # 里面有 DATABASE_URL，默认指向本机 5433
-npm install
-npm run db:up                 # 起 PostgreSQL 容器
-npm run db:migrate            # 建表
-npm run db:seed               # 写入 10 张虚构报销单
-npm run db:studio             # 浏览器里看数据（localhost:5555）
-npm run start:dev             # 起服务
+event: error
+data: {"message":"Model call failed, please retry"}
 ```
 
-起完之后打开 <http://localhost:3100> 就是那个演示页，或者用**本文开头那段 `curl`**。
-当前是 mock 模式，不需要任何 API key。
+`delta` contains incremental text that may be revised by later chunks; only `done` is final, and its payload has exactly the same shape as `/assistant/ask`. When the stream is idle for longer than `SSE_HEARTBEAT_MS`, the server sends an SSE comment frame (`: ping`), which clients should ignore per the SSE specification.
 
-常用脚本：
+### Multi-turn
 
-| 命令 | 作用 |
+Pass `history` in the request body, containing previously validated conclusions:
+
+```json
+{
+  "code": "BX-2026-0002",
+  "question": "What was that money spent on?",
+  "history": [
+    {
+      "question": "What is the total amount of this report?",
+      "conclusion": "The reimbursement amount of BX-2026-0002 is ¥12800.00.",
+      "evidence": ["code", "amount"],
+      "insufficient": false
+    }
+  ]
+}
+```
+
+At most 3 turns. History is context only; it does not expand which fields may be cited in the current turn.
+
+## API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/assistant/ask` | Returns an `AskResult` |
+| `POST` | `/assistant/askStream` | SSE: `delta` → `done`, or `error` |
+| `GET` | `/assistant/metrics` | In-process metrics snapshot |
+| `GET` | `/health` | Runs `select 1`; returns `503` when the database is unavailable |
+
+Every response carries `X-Request-Id`; logs are JSON lines that carry the same value as `reqId`.
+
+| Status | Meaning |
 |---|---|
-| `npm run db:up` / `db:down` | 起 / 停 PostgreSQL 容器 |
-| `npm run db:migrate` | 改完 schema 后建迁移 |
-| `npm run db:reset` | 清库重来（会重跑 seed） |
-| `npm run db:studio` | 数据浏览器 |
-| `npm run probe:stream` | 裸打流式端点，打印每一块的到达时间 |
-| `npm run eval` | 跑评测集，打出对/错表 |
-| `npm run lint` / `npm test` / `npm run test:e2e` | 静态检查与测试 |
-| `docker compose up --build` | 不用本机 Node，整套跑在容器里（见下节） |
+| `400` | Request validation failed |
+| `404` | Expense report not found |
+| `429` | Rate limit, concurrency limit, or daily quota exceeded |
+| `502` | Model call failed, or output failed format validation |
+| `503` | Database unavailable |
+| `504` | Overall request budget exceeded |
 
-> 数据库端口用 **5433** 而不是默认的 5432，是为了不和本机其它项目抢端口。
+Once the streaming endpoint has written response headers, the status code can no longer change. Model failures, format errors, and mid-stream database failures therefore appear as `200` + an `error` frame.
 
----
+## Design at a glance
 
-## 用 Docker 跑整套
+```
+request → validation → rate/concurrency guards → load expense → agent loop (model ↔ tools) → parse & filter → response
+```
 
-上面那套要本机装 Node、装依赖、手动建表。容器里跑则是**一条命令**，而且不依赖本机环境（Node 版本、有没有装过依赖、macOS 还是 Linux 都一样）：
+Key choices:
+
+- **Model output is not trusted.** The complete answer is type-checked; cited fields must come from this request's tool results, otherwise they are removed. `502` is reserved for format errors, not for imperfect wording.
+- **The expense ID is not a tool argument.** The server binds it, and there is no search-all or query-by-filter tool. The data a model can reach is decided by the server.
+- **Streaming does not get its own parser.** Both endpoints share `prepare()` and `settle()`; incremental text is still validated in full when the stream ends.
+- **Cancellation is wired before headers are sent.** The streaming endpoint listens for connection close before loading the expense, so an early client disconnect does not call the model or consume quota.
+- **Three independent limits.** Rate, concurrency, and daily quota address scripted abuse, request pile-up, and budget exhaustion respectively.
+- **Errors are classified by source.** Vendor failures are `502`, database failures `503`, timeouts `504`, and client cancellations are not counted as errors.
+
+Detailed design notes: [docs/design.md](docs/design.md) (Chinese).
+
+## Evaluation
+
+23 cases, each sent to both endpoints. Most expected values are computed from the database rather than hard-coded.
+
+```
+npm run eval        (mock)      : 13 passed, 10 known gaps, 0 unexpected
+npm run eval:real   (DeepSeek)  : 23 passed,  0 known gaps, 0 unexpected
+```
+
+- Structural checks are never waived: cited fields must exist, amounts and dates must be traceable, tools must not fail, and both endpoints must return the same conclusion under a deterministic provider.
+- Trajectory checks require each case to call a designated tool, so a coincidentally correct answer does not pass.
+- The 10 known gaps on mock correspond to capabilities the rule table lacks; all pass with a real model.
+- The suite has been mutation-tested to fail when a defense is removed, so an all-green run is meaningful.
+
+Case table, grading layers, and real-model results: [docs/evaluation.md](docs/evaluation.md) (Chinese).
+
+## Testing and CI
 
 ```bash
-docker compose up --build     # 库 + 迁移 + 应用
-docker compose down           # 停（数据留在 volume 里）
+npm test          # unit tests, no database required
+npm run test:e2e  # end-to-end tests and evaluation, requires a database
+npm run lint      # oxlint with type-aware checks
 ```
 
-起来之后同样是 <http://localhost:3100>。三个服务按顺序走：`db` 健康 → `migrate` 跑完退出（退出码 0）→ `app` 才开始启动。
+CI runs `lint` → `tsc --noEmit` → `build` → unit tests → end-to-end tests on every push and pull request. The database is provided by an Actions service container, migrated and seeded from scratch each run. The pipeline ends by building and starting the real container to verify health checks, one live request, no secrets in the image, a non-root process, and a clean `docker stop`.
 
-### 几个刻意的决定
+CI runs the mock only; real-model evaluation is run locally.
 
-**五段构建**（`deps → build → prod-deps → migrator → runtime`），理由只有一条：**每段产出的东西，生命周期和权限都不一样**。构建需要编译器和全部 devDependencies，只活几十秒；迁移需要能改 schema 的权限，一天跑一次；运行时只需要 `dist`、生产依赖和一个只读的 `public/`，要跑几个月。塞进同一个镜像，等于让长期运行的那个进程白白带着构建工具和一份「能改 schema」的能力。
+## Configuration
 
-实测：runtime 镜像 **372MB**，migrator 镜像 1.27GB。后者大得多，因为它带着 prisma CLI 和整棵开发依赖树 —— 这正是不把它做成常驻服务的原因。
+Main variables:
 
-**迁移是独立的一次性服务**，不是塞进 app 的启动脚本。`app` 的 `depends_on` 用的是 `service_completed_successfully`，不是默认的「启动了就算」：只等「启动了」的话，app 可能在建表之前就开始接请求，于是冷启动瞬间的请求会撞上「表不存在」—— 一个只在第一次启动出现的 bug。`migrate` 的 `restart` 是 `'no'` 而不是 `unless-stopped`：迁移失败就该停在那里让人看见，自动重启只会把同一个错误刷成刷屏日志，还会把一个跑到一半的迁移反复重试。
-
-**镜像里没有任何密钥。** `.dockerignore` 把 `.env` 排除掉，而且 Dockerfile 里**没有 `COPY . .`**，每个 `COPY` 都是点名的路径 —— 两道防线都要有：第一道防手滑加了一行 `COPY . .`，第二道防点名的路径下面夹带了别的。构建期那一次 `prisma generate` 确实需要一个 `DATABASE_URL`（`prisma.config.ts` 求值时会立刻读它），但它是用 `RUN DATABASE_URL=... npx prisma generate` 这种**只作用于一条命令**的形式给的，不是 `ENV`。区别很实际：`ENV` 会留在那一层的镜像配置里，而 migrator 是从那一层继承出去的，于是这个假连接串会一路跟着进迁移镜像，哪天忘了传环境变量，它不会报错，而是安静地去连一个 `127.0.0.1` 上的、装着假账号的库。
-
-**不以 root 跑**（`USER node`，实测容器里是 `uid=1000(node)`）。容器里的 root 就是宿主机的 root，这是最便宜的一道防线。
-
-**探活用 `/health` 而不是查端口。** 端口开着但数据库连不上时，查端口会一直报健康。探针命令用 Node 自带的 `fetch`：alpine 里没有 `curl`，为了一个探针去 `apk add` 一个包不划算。
-
-**`CMD` 用 exec 形式（数组）。** shell 形式会让 node 变成 shell 的子进程，于是 `SIGTERM` 发给 shell、node 收不到，优雅退出永远不会触发。实测 `docker kill --signal=TERM` → 209ms 退出、退出码 0，日志里有 `收到退出信号，数据库连接已释放`（那行就是 `$disconnect` 跑完的证据）。
-
-### 一个很容易踩的坑：同一个 `DATABASE_URL` 取值不一样
-
-```bash
-# 宿主机上跑 npm run start:dev  →  localhost:5433
-DATABASE_URL="postgresql://demo:demo@localhost:5433/assistant_demo?schema=public"
-
-# compose 里跑 app 容器        →  db:5432
-DATABASE_URL=postgresql://demo:demo@db:5432/assistant_demo?schema=public
-```
-
-不是笔误。容器里的 `localhost` 是容器自己，那里没有数据库。麻烦在于**两个值都是对的**，所以这个坑不会报「配置错了」，只会报「连接被拒绝」，而人会先去怀疑数据库没起来。
-
-### 限流是开着的
-
-`npm run start:dev` 和容器里都是 **30 次/分/IP**（`RATE_LIMIT_PER_MINUTE` 可调）。实测连打 35 次 → 29 个 200 + 6 个 429，被限时 `/health` 仍然 200。
-
-那个 `/health` 的豁免不是顺手加的：探活的调用方**不是用户**，是平台的健康检查。它一旦被 429，平台读到的是「不健康」→ 重启容器 → 重启后继续 429 → 死循环。而且它不碰模型、不花钱，限流本来就没有防的东西。
-
-`TRUST_PROXY` **默认关着**，只在确实部署在代理后面时才设（值是信任的跳数，托管平台通常是 `1`）。两个方向都会出错，所以不给默认值：该设没设 → 所有人的请求算成同一个 IP，一个人刷满、其他人全 429；不该设设了 → 任何人发一个 `X-Forwarded-For` 就能换个身份，限流形同虚设。
-
-### 部署到公网
-
-部署目标是 **Render + Neon**（都免费、不用绑卡）：Render 直接拿仓库里的 `Dockerfile` 构建，Neon 提供托管 Postgres。
-
-有一件事值得单独说：**迁移不在部署流程里，是单独一步**，而且要从本机跑。`docker compose` 那套之所以能把迁移做成一个独立服务，是因为它是自家编排；托管平台上要么用付费的 pre-deploy 功能、要么让 runtime 镜像带上 prisma CLI（那就白分了层）。演示项目的迁移是一次性的，从本机跑一次最省事，代价是**改 schema 之后要记得手动再跑一次**。
-
----
-
-## 数据模型
-
-两张表，够用为止：
-
-```
-Expense（报销单）                    ExpenseItem（费用明细）
-├─ code        BX-2026-0003         ├─ name       「客户晚餐（6 人）」
-├─ applicant   张三（占位名）        ├─ category   ENTERTAIN
-├─ department  市场部                ├─ amount     2680.00
-├─ category    ENTERTAIN            ├─ spentOn    2026-03-14  ← 费用发生日
-├─ amount      2766.00  ← 明细之和  └─ note
-├─ status      REJECTED
-├─ rejectReason 「招待费超出…」       ← 仅 REJECTED 时有值
-├─ submittedAt 2026-03-15           ← 提交日
-└─ decidedAt   2026-03-18           ← 决策日，未决策时为 null
-```
-
-三个刻意的设计：
-
-1. **总额是明细之和的投影**，由 seed 计算写入、不手填 —— 从数据层面杜绝「总额对不上明细」。
-2. **状态和分类用 enum**，不用自由字符串。这让 prompt 里可以列全合法取值，模型的回答空间被收窄，结构化输出的校验才立得住。
-3. **可空字段是「有信息量」的空**：`rejectReason` 只在驳回时有值、`decidedAt` 只在已决策时有值。这给了「信息不足」一个自然来源 —— 问一张草稿单「审批意见是什么」，正确答案是「数据里没有」，而不是编一个。
-
-`spentOn`（费用发生日）和 `submittedAt`（提交日）**不是一回事**：可以先发生、后报销。`BX-2026-0006` 的费用发生在 3 月、整单 4 月才提交 —— 这是评测里的陷阱用例。
-
----
-
-## 模型答得不对时会发生什么
-
-让模型输出 JSON 只是开始，真正的工作是**不信任它**。两条防线，对应两种不同的错：
-
-**一、格式不对** —— 没按 JSON 答、字段缺失、把 `insufficient` 写成字符串 `"false"`。
-
-处理在 `parse-answer.ts`：先取第一个 `{` 到最后一个 `}`（顺带吃掉 ```json 代码块和前后寒暄），
-再逐字段校验类型。任一条不过，返回 502 而不是把半个答案塞给用户。
-它是纯函数，所以能穷举地测 —— 见 `parse-answer.spec.ts` 的 24 个用例。
-
-**二、编字段** —— 格式完全正确，但引用的字段根本不存在。
-
-这条防线的支点是一个设计选择：**可引用字段清单是遍历数据算出来的，不是手写的白名单**
-（`expense-context.ts`）。于是「凡是能引用到的，都真的给过模型」。模型引用了清单外的路径，
-`AssistantService` 会把它从 `evidence` 里剔掉并记一条 warn。
-
-这里刻意**不报错**：模型多写一个字段名通常是措辞瑕疵，为它返回 502 等于让一次小毛病
-变成用户看到的错误页。剔除保证的是「用户看到的依据一定真实存在」。
-下面的评测就是数这条 warn 来算幻觉率。
-
-想亲眼看它拦一次：
-
-```bash
-MOCK_MISBEHAVE=unknown-field npm run start:dev
-# 日志：模型引用了不存在的字段，已剔除：[approverSignature]（单号 BX-2026-0003）
-```
-
-> **诚实边界**：剔除只保证 `evidence` 不撒谎，**不保证 `conclusion` 因此就对了**。
-> 结论对不对是下面「评测」要回答的问题，不是这道校验能回答的。
-
----
-
-## 流式
-
-页面上「字一个个出来」不是加载动画，是 SSE。两条端点并存：
-
-| | `POST /assistant/ask` | `POST /assistant/askStream` |
+| Variable | Default | Description |
 |---|---|---|
-| 返回 | 一个 JSON | `text/event-stream` |
-| 事件 | — | `delta…` → `done`（或中途 `error`） |
-| 最终结果 | `AskResult` | `done` 事件里装的**同一个** `AskResult` |
-| 校验 | `parseAnswer` + 防幻觉 | **完全相同**，两条路只有一个收口函数 `settle()` |
+| `LLM_PROVIDER` | `mock` | `mock` or `openai` (OpenAI-compatible protocol) |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | — | Required when `LLM_PROVIDER=openai` |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Requests per IP per minute |
+| `MAX_CONCURRENT_ASKS` | `8` | Max in-flight model requests; `0` disables |
+| `LLM_DAILY_LIMIT` | off | Daily model-call quota |
+| `ASK_TIMEOUT_MS` | `90000` | Total budget for one question |
+| `LLM_TIMEOUT_MS` | `30000` | Per-call timeout |
+| `SSE_HEARTBEAT_MS` | `15000` | Idle heartbeat interval for streams |
+| `TRUST_PROXY` | unset | Number of trusted proxy hops; set only behind a proxy |
 
-最后一行是重点。流式版本如果自己走一套解析，增量吐出去的字就成了绕过校验的后门 ——
-用户会看到一段没经过格式校验、也没过防幻觉的文本。所以两条端点共用 `prepare()`
-（组 prompt）和 `settle()`（收口），能漂移的地方只有一处，而那一处被 e2e 钉着：
-「两条端点给出完全相同的结论」。
+To use a real model, change `.env` only — no code changes:
 
-### 增量解析器
-
-难点是在 `{"conclusion": "这张单…` 这种还没闭合的状态下，认出它已经说了什么。
-
-关键决定：**不做状态机，每次拿到新的一块就从头重扫整个 buffer。**
-状态机得在状态里保存「我正停在哪个转义序列中间」—— 那恰恰是最容易写错、
-也最难测的地方。重扫是幂等的：同一段文本永远得到同一个结果，没有状态可以出错。
-代价是整体 O(n²)，但 n 是一句话的长度，为它引入状态机不划算。
-
-`stream-parse.spec.ts` 证的就是它 —— 在**任意**下标处切成两块、按码元一个个喂、
-按码点一个个喂，拼出来的结果都必须和最终 `parseAnswer` 认可的结论**逐字相同**。
-
-顺带一个容易漏的点：`😀` 拆在两次 chunk 里时，只吐前一半会在页面上显示成半个字符。
-所以宁可等。但「等」要有止境 —— 已经流到的部分如果能**证明**这是个孤立代理，就照实吐出去。
-
-### 断线
-
-`res.on('close')` 里判 `res.writableEnded`：只有「响应没写完就 close 了」才当成客户端断开，
-去 `abort()` 掉还在跑的模型请求。光看 `close` 分不清「用户走了」和「我们写完了」。
-
-实测（`npm run probe:stream`）：`BX-2026-0003` 首字 155ms / 总耗时 778ms，
-客户端 300ms 时断开则服务端日志留下「客户端已断开」，并且**不会**再打「流式回答完成」。
-
-### 诚实边界
-
-- 增量解析器不保证 `conclusion` 是顶层键，也不防别的字符串值里出现 `"conclusion"`
-  （有一条测试**专门记录**这个已知缺陷）。兜底是流结束后的 `parseAnswer` ——
-  页面上「生成中」显示的字随时可能被最终结果覆盖，所以它必须变成「已确认」才算数。
-- `MockLlmProvider.stream()` **是假流式**：它先拿到完整答案，再切块吐出去。
-  真流式的核心收益 —— 首字延迟 —— 它一点都吃不到。换成真厂商后管道代码一行不用改，
-  只有首字延迟会从「一次 sleep」变成真实值。
-- **结构化输出的代价**：结论说完之后，模型还得输出 `evidence` 和 `insufficient`。
-  一次实测里最后一个字 639ms 到齐，请求 1033ms 才结束 —— 最后 400ms 页面是静止的。
-  这是「既要流式又要结构化」的真实成本，不是 bug。想要最后那段也有内容，
-  就得把 evidence 也做成增量解析，收益不值这个复杂度。
-
----
-
-## 评测
-
-`npm run eval` —— 10 条用例，每条同时打**两条**端点。
-
-| 用例 | 单号 | 测什么 | 增量/最终 | 判定 |
-|---|---|---|---|---|
-| E01 | BX-2026-0003 | 能答：驳回原因 | 44 / 44 | ✓ |
-| E02 | BX-2026-0009 | 能答：第二条驳回单 | 38 / 38 | ✓ |
-| E03 | BX-2026-0005 | 信息不足：草稿单没有审批 | 36 / 36 | ✓ |
-| E04 | BX-2026-0004 | 信息不足：待审批也没意见 | 41 / 41 | ✓ |
-| E05 | BX-2026-0010 | 能答：草稿 ≠ 全无信息 | 31 / 31 | ✓ |
-| E06 | BX-2026-0002 | 能答：多明细 + 合计 | 78 / 78 | ✓ |
-| E07 | BX-2026-0001 | 金额溯源：¥3150.00 | 29 / 29 | ✓ |
-| E08 | BX-2026-0006 | 陷阱：费用发生日 vs 提交日 | 31 / 31 | ⚠ 已知不足 |
-| E09 | BX-2026-0008 | 能答：单条与多条明细 | 75 / 75 | ✓ |
-| E10 | BX-2026-0007 | 数据里根本没有这个维度 | 51 / 51 | ⚠ 已知不足 |
-
-```
-通过 8　已知不足 2　不符预期 0
-幻觉率 0/10（依据里出现数据之外的字段，被防线剔除并记了日志的用例数）
+```bash
+LLM_PROVIDER=openai
+LLM_API_KEY=...
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
 ```
 
-「增量/最终」两列相等，是因为每条用例都断言了增量吐出的字和最终结论**逐字相同**。
+`npm run eval:real` then runs the same suite against that provider.
 
-### 这张表在测什么
+Full list and notes: [`.env.example`](.env.example) and [docs/operations.md](docs/operations.md) (Chinese).
 
-三层，从硬到软：
+## Deployment
 
-**一、结构底线** —— 永远算失败，不豁免：
+```bash
+docker compose up --build   # database + migrations + app
+```
 
-- `evidence` 里每个字段都必须在「可引用字段」清单里
-- 结论里带 `¥` 或「元」的数字，必须能在数据里找到同一个数
-- 结论里的日期，同理
-- 两条端点给出**完全相同**的结论
+The image is built in five stages, runs as a non-root user, and contains no secrets. The app verifies the database on startup and does not wait for active connections on shutdown. The deployment target is Render + Neon; migrations are run manually from a local machine.
 
-第一条看着像废话（服务端已经剔过了）。它是**交叉验证**：哪天有人把
-`dropUnknownEvidence` 删了或改坏了，评测会立刻响，而不是等用户看到一段编出来的依据。
-「评测不采信被测代码的自述」是这份文件的基本立场。
+Details: [docs/operations.md](docs/operations.md) (Chinese).
 
-**二、语义** —— 断言该不该说信息不足、答没答到点上。措辞会随模型变，语义不该变。
-所以断言的是「依据里有没有 `rejectReason`」，不是模型的句子。
+## Known limitations
 
-**三、能从数据里算的期望就不手写** —— 金额、明细名、驳回原因、日期全部从库里读。
-剩下几个手写关键词由一条**预检**用例兜住：它先证明这些字符串真的在数据里。
-否则用例会以一种「看起来像模型答错了」的方式失败，然后就会有人去改 prompt。
-这条预检当场就抓到过一次真错 —— 明细名是「易拉宝 2 个」，而我写的期望是全等的「易拉宝」。
+This is a demo project, not a production system:
 
-### 那两条红的
+- No authentication, authorization, or multi-tenant isolation.
+- Metrics, rate limits, concurrency limits, and daily quota are in-process. Multiple instances count independently, and restarts reset them.
+- No tracing, log aggregation, or cross-instance aggregation.
+- The incremental parser does not guarantee `conclusion` is a top-level key; the full validation after the stream ends is the safety net.
+- Cost estimates exclude cache pricing and are therefore an upper bound, not a bill.
+- Mock token counts are estimated from character length, not tokenizer output.
+- Real-model evaluation is a single sample; outputs are not guaranteed to be reproducible.
 
-一个全绿的评测说明不了什么。这两条红得有价值，它们说的正是**换成真模型之后最该盯的两件事**：
+Out of scope: RAG (the data is structured, so querying the database directly is the right approach), complex agent orchestration, and conversation persistence.
 
-- **E08 费用发生日 vs 提交日。** 问「费用发生的日期是哪天」，答的是整单的 `submittedAt`。
-  日期溯源检查放行了它 —— 因为 `2026-04-07` 确实在数据里。**溯源只能证明「这个日期真的存在」，
-  证明不了「它被用在了正确的问题上」。**
-- **E10 数据里根本没有这个维度。** 问「发票号是多少」，数据模型里没有发票号这个字段，
-  正确答案是 `insufficient: true`。它答了另一个问题，还声称自己信息充分。
-  **真实性（知道自己不知道）是最该盯的一条。**
+## Data
 
-已知不足不是免罪符：哪天它不红了，用例会失败并要求把这个标记删掉。
+All data in this repository is fictional: names are placeholders such as "Zhang San / Li Si / Wang Wu", with no real people, ID numbers, phone numbers, or data from any real business system. Amounts are invented as well.
 
-### 评测必须能红
-
-所以主动把它弄红过两次。
-
-**一、让 mock 每次回答都多写一个不存在的字段**（`MOCK_MISBEHAVE=unknown-field`）：
-
-| | 判定列 | 幻觉率 |
-|---|---|---|
-| 正常 | 8 ✓　2 ⚠ | 0/10 |
-| 注入幻觉 | 8 ✓　2 ⚠ | **10/10** |
-
-判定列**一字未变**，幻觉率从 0 涨到 10。这一对结果同时说明两件事：防线真的在拦东西，
-以及这个指标真的会动 —— 0% 不是「指标坏了」。
-
-**二、把 `dropUnknownEvidence` 临时拆掉**：10 条全红，包括那两条「已知不足」的。
-后者逼出一个设计修正：**已知不足只豁免语义，不豁免结构底线** ——
-否则一个标记会把管道故障一起盖住。这个漏洞是变异测试发现的，不是想出来的。
-
-### 诚实边界
-
-- **这份评测证明不了「模型答得准」。** 现在跑的是规则表，不是模型。它能证明的是
-  「**评测本身是有效的**」：会红、能算幻觉率、能发现两条端点漂移。
-  换成真厂商之后，**同一份用例**才有资格回答「答得准不准」。
-- **金额溯源只认数据里已有的数。** 模型自己算出的中间和（比如「差旅类共 2700 元」）
-  会被误判成编造。用真模型跑之前得先决定：放宽成「不超过总额」，还是把中间和也纳入已知集合。
-- **日期留了 ±1 天的容差。** seed 里的日期按 `+08:00` 写入，取出来是 UTC，同一天会显示成
-  前一天。宁可松也不能误报。另外 MM-DD 那一层不区分年份 —— 这个项目的日期都在同一年内。
-- **幻觉率数的是日志。** 那道防线是「剔除」不是「报错」，从返回值上看不出它拦过东西。
-  这就是 `HALLUCINATION_WARN` 被单独导成常量的原因：它已经是评测的输入之一，
-  改文案却不改这里，评测会静默地一直报 0%。
-
----
-
-## 关于那个 mock
-
-`LLM_PROVIDER=mock` 时用的是 `mock-llm.provider.ts` —— 它**不是模型，是一张规则表**：
-按问题里的关键词查表，把字段拼成一句中文。
-
-它的价值是让**管道**能被测：真实模型的输出不可复现，而「取数 → 组 prompt → 调用 → 解析 →
-校验字段」这条链路的每一步都能用假模型写死断言。
-
-它**不能**证明「模型答得准」—— 那必须在真模型上跑。这两件事别混为一谈。
-
-换厂商时改的只有 `llm.module.ts` 里的一行绑定，业务代码一行不动。
-
----
-
-## 两个坑
-
-### Prisma 7 的破坏性改动
-
-照着 Prisma 5/6 的教程写会直接卡住：
-
-1. **`url` 不能写在 `schema.prisma` 里**了，写了报 `P1012`。连接串移到 `prisma.config.ts`。
-2. **PrismaClient 不再自己管连接**，构造时必须传一个 driver adapter（`new PrismaPg(...)`），否则抛「Pass a driver adapter」。
-3. **generator 从 `prisma-client-js` 改名成 `prisma-client`**，且 `output` 变成必填 —— 生成的 client 落在 `src/generated/prisma`，import 走相对路径。
-4. **Prisma CLI 不再自动读 `.env`**，要在 `prisma.config.ts` 里手动 `import 'dotenv/config'`。
-
-### npm 解析崩溃
-
-`npm install` 会报 `Cannot read properties of null (reading 'edgesOut')` —— 这是 npm 10.8.2 自己的 bug，全新空目录也会复现。仓库里的 `.npmrc` 用 `legacy-peer-deps=true` 绕开，原因写在那个文件里。
-
----
-
-## 进度
-
-- [x] 数据层：schema、迁移、10 条虚构数据、Docker 起库
-- [x] LLM 抽象 + `POST /assistant/ask` 结构化输出 + DTO 运行时校验 + 两条防线
-- [x] SSE 流式 + 增量解析 + 一个 `index.html`
-- [x] 评测集：10 条用例 + 一张对/错表
-- [x] Dockerfile：五段构建、非 root、探活、优雅退出、限流
-- [ ] 部署到公网 —— Render + Neon
-
-**还没做的**：工具调用、多轮对话、RAG、Agent 编排。
-
----
-
-## 关于数据
-
-仓库里的所有数据都是虚构的：姓名一律用「张三 / 李四 / 王五 / 赵六 / 孙七」这类占位名，没有真实人员、身份证号、手机号，也没有任何来自真实业务系统的数据。金额同样是编的。
+The seed inserts 10 expense reports covering draft, pending approval, approved, rejected, and paid states, used by both normal-path and edge-case evaluations.
