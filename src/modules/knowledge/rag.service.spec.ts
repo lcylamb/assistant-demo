@@ -81,10 +81,11 @@ async function fakeStore(): Promise<InMemoryVectorStore> {
   return store;
 }
 
-/** 绕过 onModuleInit（真模型太重）与 getModel（真 LLM key），直接注入桩 */
+/** 绕过懒加载建库（真模型太重）与 getModel（真 LLM key），直接注入桩 */
 async function serviceWith(script: string[]) {
   const service = new KnowledgeService({ get: () => undefined } as never);
   (service as never as { store: InMemoryVectorStore }).store = await fakeStore();
+  (service as never as { ready: boolean }).ready = true; // 跳过 buildStore 的真模型加载
   const model = scriptedModel(script);
   (service as never as { chatModel: unknown }).chatModel = model;
   return { service, model };
@@ -181,6 +182,15 @@ describe('KnowledgeService（RAG 图）', () => {
   it('generate 输出缺 answer：ask 抛 503，而不是把空答案当成功', async () => {
     const { service } = await serviceWith(['{"relevant": true}', '{"citations": []}']);
 
+    await expect(service.ask('招待费上限')).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  it('KNOWLEDGE_ENABLED=false：直接 503，不去加载模型也不建库', async () => {
+    const service = new KnowledgeService({
+      get: (key: string) => (key === 'KNOWLEDGE_ENABLED' ? 'false' : undefined),
+    } as never);
+
+    // enabled 检查在建库之前：小内存实例即使误调这个端点也不会 OOM
     await expect(service.ask('招待费上限')).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 

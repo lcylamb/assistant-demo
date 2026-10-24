@@ -177,7 +177,10 @@ so switching to pgvector later touches one file. Embeddings run locally —
 DeepSeek has no embeddings endpoint.
 
 Requires a real model (`LLM_API_KEY`) and a one-time ~90MB local embedding
-model download. Details: [docs/knowledge.md](docs/knowledge.md) (Chinese).
+model download; the index is built lazily on the first question. Memory note:
+the embedding model puts the process at ~714MB RSS, so small-memory hosts
+(Render free tier: 512MB) must set `KNOWLEDGE_ENABLED=false`. Details:
+[docs/knowledge.md](docs/knowledge.md) (Chinese).
 
 ## Evaluation
 

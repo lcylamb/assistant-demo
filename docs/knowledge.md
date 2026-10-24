@@ -52,5 +52,9 @@ START → retrieve → grade ─┬─(相关)───────────�
 
 - 该模块**必须有真实模型**才能工作（mock provider 不覆盖它）：需要 `LLM_API_KEY`
   与可用的 OpenAI 兼容端点，以及本地 embedding 模型（首次运行下载约 90MB）。
+- **内存是硬约束**：embedding 模型加载后进程 RSS 实测约 714MB（基线 87MB，
+  量化 q8 + ONNX 运行时）。因此建库是**懒加载**的——第一次 `ask` 才切分、
+  embedding、建索引，不调用就不占内存；小内存部署实例（Render 免费 512MB）
+  装不下，必须设 `KNOWLEDGE_ENABLED=false` 显式关闭，关闭后该端点直接 503。
 - 语料硬编码在 `policy-docs.ts`，没有做后台管理；换语料改这一个文件即可。
 - 检索是内存余弦相似度，语料规模到千块以上时应换持久向量库（接口已对齐）。

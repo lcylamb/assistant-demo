@@ -18,7 +18,7 @@
  * 的自愈手段。重试只允许一次（rewritten 标志位封口），防止图里长出循环。
  */
 
-import { Injectable, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { Document } from '@langchain/core/documents';
@@ -96,7 +96,7 @@ const GENERATE_PROMPT = `你是报销制度问答助手。只依据下面给出�
 只输出一个 JSON 对象，格式：{"answer": "回答", "citations": ["引用的章节"]}。不要输出其他内容。`;
 
 @Injectable()
-export class KnowledgeService implements OnModuleInit {
+export class KnowledgeService {
   private readonly logger = new Logger(KnowledgeService.name);
   private store!: InMemoryVectorStore;
   /** 编译后的图只需要 invoke 这一个方法，用结构化类型避开泛型的循环推断 */
@@ -104,11 +104,29 @@ export class KnowledgeService implements OnModuleInit {
     invoke(state: Partial<typeof GraphState.State>): Promise<typeof GraphState.State>;
   } | null = null;
   private chatModel: ChatOpenAI | null = null;
+  /** 知识库是否已建好。懒加载：第一次 ask 才切分 + embedding（见 buildStore 的注释） */
+  private ready = false;
 
   constructor(private readonly config: ConfigService) {}
 
-  /** 启动时建库：切分 → embedding → 入库。纯本地操作，不需要 LLM key。 */
-  async onModuleInit(): Promise<void> {
+  /**
+   * 知识库是否启用。默认开（本地开发零配置）；Render 这类小内存部署实例
+   * 上设 KNOWLEDGE_ENABLED=false 显式关掉 —— 本地模型加载后 RSS 实测 714MB，
+   * 免费实例 512MB 装不下，eager 加载会让服务崩在启动阶段。
+   */
+  private get enabled(): boolean {
+    return this.config.get<string>('KNOWLEDGE_ENABLED') !== 'false';
+  }
+
+  /**
+   * 懒加载建库：切分 → embedding → 入库。纯本地操作，不需要 LLM key。
+   * 放在首次 ask 而不是 onModuleInit 的原因有两个：
+   * 1. 启动时间：模型加载 + 全量 embedding 要几秒，不该摊在每次部署重启上；
+   * 2. 内存：embedding 模型加载后 RSS 约 714MB（实测），512MB 的免费部署
+   *    实例根本装不下 —— 懒加载至少保证「不调用就不占内存」，配合
+   *    KNOWLEDGE_ENABLED=false 让小内存实例安全跳过整个模块。
+   */
+  private async buildStore(): Promise<void> {
     const started = Date.now();
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 300,
@@ -126,12 +144,19 @@ export class KnowledgeService implements OnModuleInit {
     const chunks = await splitter.splitDocuments(docs);
     this.store = new InMemoryVectorStore(new LocalEmbeddings());
     await this.store.addDocuments(chunks);
+    this.ready = true;
     this.logger.log(
       `知识库就绪：${POLICY_SECTIONS.length} 个章节 → ${chunks.length} 个知识块（${Date.now() - started}ms）`,
     );
   }
 
   async ask(question: string): Promise<KnowledgeAnswer> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException(
+        '知识库问答未启用（KNOWLEDGE_ENABLED=false）：该部署实例内存不足以运行本地 embedding 模型',
+      );
+    }
+    if (!this.ready) await this.buildStore();
     const graph = await this.getGraph();
     const result = await graph.invoke({
       question,
