@@ -1,6 +1,6 @@
 # 设计与实现
 
-本文说明 assistant-demo 的内部结构和主要设计选择。运行方式见 [README](../README.md)。
+本文说明 expense-assistant 的内部结构和主要设计选择。运行方式见 [README](../README.md)。
 
 ## 架构
 

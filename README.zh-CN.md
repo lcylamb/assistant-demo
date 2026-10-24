@@ -1,6 +1,6 @@
-# assistant-demo
+# expense-assistant
 
-[![CI](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/assistant-demo/actions/workflows/ci.yml)
+[![CI](https://github.com/lcylamb/expense-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/lcylamb/expense-assistant/actions/workflows/ci.yml)
 
 **[English](README.md)**
 
@@ -229,7 +229,7 @@ docker compose up --build   # 数据库 + 迁移 + 应用
 
 ## 已知限制
 
-这是一个演示项目，不是生产系统：
+这是一个练习项目，不是生产系统：
 
 - 没有权限体系与多租户隔离；
 - 指标、限流、并发上限、日额度都保存在单个进程的内存中，多实例各算各的、重启清零；

@@ -19,7 +19,7 @@
 services:
   db:
     image: postgres:16-alpine
-    container_name: assistant-demo-pg
+    container_name: expense-assistant-pg
     restart: unless-stopped
     environment:
       POSTGRES_USER: demo
@@ -48,7 +48,7 @@ services:
     build:
       context: .
       target: migrator
-    container_name: assistant-demo-migrate
+    container_name: expense-assistant-migrate
     environment:
       DATABASE_URL: postgresql://demo:demo@db:5432/assistant_demo?schema=public
     depends_on:
@@ -64,7 +64,7 @@ services:
     build:
       context: .
       target: runtime
-    container_name: assistant-demo-app
+    container_name: expense-assistant-app
     environment:
       NODE_ENV: production
       PORT: 3100
