@@ -7,6 +7,7 @@ import { AppController } from './app.controller.js';
 import { IpThrottlerGuard } from './ip-throttler.guard.js';
 import { PINO_HTTP_OPTIONS } from './logging.js';
 import { AssistantModule } from './modules/assistant/assistant.module.js';
+import { KnowledgeModule } from './modules/knowledge/knowledge.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 
 @Module({
@@ -61,6 +62,7 @@ import { PrismaModule } from './prisma/prisma.module.js';
 
     PrismaModule,
     AssistantModule,
+    KnowledgeModule,
   ],
   controllers: [AppController],
   providers: [
