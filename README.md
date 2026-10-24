@@ -15,6 +15,7 @@ Open <http://localhost:3100> after `npm run start:dev`. The default provider is 
 - **Tool calling** — the model fetches data through three read-only tools. The expense ID is bound by the server and cannot be chosen by the model.
 - **Streaming** — the conclusion is extracted incrementally from partial JSON; streaming and non-streaming responses share the same final validation. True token-by-token streaming with a real provider; the mock simulates chunks.
 - **Multi-turn** — the client sends back the previous turn's validated conclusion; the server keeps no session state.
+- **Policy Q&A (RAG)** — a second module answers questions about the (fictional) expense policy handbook: document splitting, local embeddings, retrieval, and a LangGraph quality gate that rewrites the query and retries when retrieval comes back irrelevant.
 - **Evaluated** — 23 cases cover tool trajectories, prompt injection, and cross-record access, run against a real database in CI.
 - **Observable** — request IDs, access logs, latency / time-to-first-token / token / cost metrics, and rejected-request counters.
 - **Mock-first** — a rule-based provider makes the full test suite reproducible without network access or credentials.
@@ -160,6 +161,24 @@ Key choices:
 
 Detailed design notes: [docs/design.md](docs/design.md) (Chinese).
 
+## Policy Q&A (RAG)
+
+`POST /knowledge/ask` answers questions about the expense policy handbook — the
+complement to the assistant module: one looks up what happened to a report, the
+other looks up what the policy says. Pipeline: splitting → local embeddings →
+vector retrieval → citation-checked generation, with a LangGraph node that
+grades retrieval quality and rewrites the query once before giving up
+(`queryRewritten: true` marks that path; out-of-scope questions are answered as
+"not covered", with empty `sources`).
+
+The vector store is a 60-line in-memory implementation behind the standard
+`VectorStore` interface (`@langchain/community` v1 dropped MemoryVectorStore),
+so switching to pgvector later touches one file. Embeddings run locally —
+DeepSeek has no embeddings endpoint.
+
+Requires a real model (`LLM_API_KEY`) and a one-time ~90MB local embedding
+model download. Details: [docs/knowledge.md](docs/knowledge.md) (Chinese).
+
 ## Evaluation
 
 23 cases, each sent to both endpoints. Most expected values are computed from the database rather than hard-coded.
@@ -196,6 +215,7 @@ Main variables:
 |---|---|---|
 | `LLM_PROVIDER` | `mock` | `mock` or `openai` (OpenAI-compatible protocol) |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | — | Required when `LLM_PROVIDER=openai` |
+| `HF_MIRROR` | unset | HuggingFace mirror for the local embedding model download (set when hf.co is unreachable) |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Requests per IP per minute |
 | `MAX_CONCURRENT_ASKS` | `8` | Max in-flight model requests; `0` disables |
 | `LLM_DAILY_LIMIT` | off | Daily model-call quota |
