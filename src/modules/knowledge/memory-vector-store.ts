@@ -36,22 +36,27 @@ export class InMemoryVectorStore extends VectorStore {
     const texts = documents.map((d) => d.pageContent);
     const embeddings = await this.embeddings.embedDocuments(texts);
     // zip：embedding 顺序和输入顺序一致，这是 embedDocuments 的契约
-    this.vectors = documents.map((document, i) => ({
-      document,
-      vector: embeddings[i],
-    }));
+    await this.addVectors(embeddings, documents);
   }
 
   async addVectors(vectors: number[][], documents: Document[]): Promise<void> {
     if (vectors.length !== documents.length) {
       throw new Error(`向量数 ${vectors.length} 与文档数 ${documents.length} 不一致`);
     }
-    this.vectors = vectors.map((vector, i) => ({ document: documents[i], vector }));
+    // 入库前统一 L2 归一化，余弦相似度 = 点积。不能假设 embedding 实现已经
+    // 归一化过：LocalEmbeddings 在模型层开了 normalize，但这个库的契约不该
+    // 依赖调用方的实现细节 —— 换 embedding（或未来迁 pgvector 前的直灌
+    // addVectors 路径）时，忘掉归一化的表现是「分数悄悄不再是余弦」，排错
+    // 成本远高于每次入库一次 O(n·d) 的除法。
+    this.vectors = vectors.map((vector, i) => ({
+      document: documents[i],
+      vector: l2Normalize(vector),
+    }));
   }
 
   /**
    * 基类约定的检索原语：给查询向量和 k，返回 [Document, 相似度] 列表。
-   * 向量在入库时已 L2 归一化，余弦相似度 = 点积。
+   * 库内向量已归一化，查询向量在这里同样归一化后再算点积。
    * filter 参数是基类签名的一部分（本实现用不上，接收但忽略）。
    */
   async similaritySearchVectorWithScore(
@@ -60,12 +65,18 @@ export class InMemoryVectorStore extends VectorStore {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     filter?: this['FilterType'],
   ): Promise<[Document, number][]> {
+    const query = l2Normalize(vector);
     const scored = this.vectors
-      .map((s) => ({ ...s, score: dotProduct(vector, s.vector) }))
+      .map((s) => ({ ...s, score: dotProduct(query, s.vector) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, k);
     return scored.map((s) => [s.document, s.score] as [Document, number]);
   }
+}
+
+function l2Normalize(vector: number[]): number[] {
+  const norm = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0));
+  return norm === 0 ? vector.slice() : vector.map((v) => v / norm);
 }
 
 function dotProduct(a: number[], b: number[]): number {
